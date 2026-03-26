@@ -328,6 +328,56 @@ app.delete('/api/announcements/:id', authMiddleware(['team_lead']), async (req, 
 });
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (_, res) => res.json({ status: 'ok', time: new Date() }));
+
+// ── CALL FLOWS ──────────────────────────────────────────────────────────────
+app.get('/api/callflows', authMiddleware(), async (req, res) => {
+  const r = await pool.query(`SELECT cf.*,u.name as created_by_name FROM call_flows cf LEFT JOIN users u ON u.id=cf.created_by WHERE cf.is_active=true ORDER BY cf.display_order,cf.id`).catch(() => null);
+  res.json(r ? r.rows : []);
+});
+
+app.get('/api/callflows/all', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const r = await pool.query(`SELECT cf.*,u.name as created_by_name FROM call_flows cf LEFT JOIN users u ON u.id=cf.created_by ORDER BY cf.display_order,cf.id`).catch(() => null);
+  res.json(r ? r.rows : []);
+});
+
+app.post('/api/callflows', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const { title, icon, color, description, note, steps, display_order } = req.body;
+  if (!title || !steps) return res.status(400).json({ error: 'title and steps required' });
+  const r = await pool.query(
+    'INSERT INTO call_flows(title,icon,color,description,note,steps,display_order,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+    [title, icon||'📞', color||'#3b82f6', description||'', note||null, JSON.stringify(steps), display_order||0, req.user.id]
+  ).catch(e => ({ error: e.message }));
+  if (r.error) return res.status(500).json({ error: r.error });
+  res.json(r.rows[0]);
+});
+
+app.put('/api/callflows/:id', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const { title, icon, color, description, note, steps, display_order, is_active } = req.body;
+  const r = await pool.query(
+    'UPDATE call_flows SET title=$1,icon=$2,color=$3,description=$4,note=$5,steps=$6,display_order=$7,is_active=$8,updated_at=NOW() WHERE id=$9 RETURNING *',
+    [title, icon, color, description, note||null, JSON.stringify(steps), display_order||0, is_active!==false, req.params.id]
+  ).catch(e => ({ error: e.message }));
+  if (r.error) return res.status(500).json({ error: r.error });
+  res.json(r.rows[0]);
+});
+
+app.delete('/api/callflows/:id', authMiddleware(['team_lead']), async (req, res) => {
+  await pool.query('DELETE FROM call_flows WHERE id=$1', [req.params.id]).catch(() => null);
+  res.json({ success: true });
+});
+
+app.patch('/api/callflows/:id/toggle', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const r = await pool.query('UPDATE call_flows SET is_active=NOT is_active WHERE id=$1 RETURNING is_active', [req.params.id]).catch(() => null);
+  res.json(r ? r.rows[0] : { error: 'failed' });
+});
+
+app.get('/api/health', async (_, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'connected', time: new Date() });
+  } catch(e) {
+    res.status(500).json({ status: 'error', db: 'failed', error: e.message });
+  }
+});
 
 module.exports = app;
