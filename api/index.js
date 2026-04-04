@@ -118,6 +118,25 @@ app.get('/api/users/stats/peak-hours', authMiddleware(['team_lead']), async (req
   r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
 });
 
+
+app.patch('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const { name, email, role, title, password } = req.body;
+  const updates = []; const vals = [];
+  if (name)     { updates.push(`name=$${updates.length+1}`);  vals.push(name); }
+  if (email)    { updates.push(`email=$${updates.length+1}`); vals.push(email); }
+  if (role)     { updates.push(`role=$${updates.length+1}`);  vals.push(role); }
+  if (title !== undefined) { updates.push(`title=$${updates.length+1}`); vals.push(title); }
+  if (password) {
+    const bcrypt = require('bcryptjs');
+    const hashed = await bcrypt.hash(password, 10);
+    updates.push(`password_hash=$${updates.length+1}`); vals.push(hashed);
+  }
+  if (!updates.length) return res.json({ success: true });
+  vals.push(req.params.id);
+  await pool.query(`UPDATE users SET ${updates.join(',')} WHERE id=$${vals.length}`, vals).catch(() => {});
+  res.json({ success: true });
+});
+
 app.patch('/api/users/:id/reset-password', authMiddleware(['team_lead']), async (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
