@@ -390,6 +390,180 @@ app.patch('/api/callflows/:id/toggle', authMiddleware(['qa_officer','team_lead']
   res.json(r ? r.rows[0] : { error: 'failed' });
 });
 
+// ─── MAINTENANCE MODE ────────────────────────────────────────────────────────
+// Stored in DB as a simple key-value in a settings table
+// GET  /api/maintenance        → public, returns { active, message }
+// POST /api/maintenance        → team_lead only, sets active + message
+// Lazy-create settings table if needed
+
+app.get('/api/maintenance', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key   VARCHAR(100) PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    const { rows } = await pool.query(`SELECT value FROM settings WHERE key = 'maintenance'`);
+    if (!rows.length) return res.json({ active: false, message: '' });
+    const data = JSON.parse(rows[0].value);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/maintenance', authMiddleware(['team_lead']), async (req, res) => {
+  const { active, message } = req.body;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key   VARCHAR(100) PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    await pool.query(`
+      INSERT INTO settings (key, value)
+      VALUES ('maintenance', $1)
+      ON CONFLICT (key) DO UPDATE SET value = $1
+    `, [JSON.stringify({ active: !!active, message: message || '' })]);
+    res.json({ success: true, active: !!active });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── EVALUATIONS ─────────────────────────────────────────────────────────────
+
+// Upload evaluations from parsed Excel JSON (sent from frontend)
+app.post('/api/evaluations/upload', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const rows = req.body.rows;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided' });
+
+  try {
+    let inserted = 0;
+    for (const r of rows) {
+      // Skip rows with no agent email or name
+      if (!r.agent_email && !r.agent_name) continue;
+
+      // Parse date safely
+      let evalDate = null;
+      if (r.evaluation_date) {
+        try { evalDate = new Date(r.evaluation_date).toISOString().split('T')[0]; } catch {}
+      }
+
+      await pool.query(`
+        INSERT INTO evaluations (
+          agent_name, agent_email, coordinator, qa_officer, subject,
+          phone_number, ticket_id, waiting_time, call_duration,
+          greeting_script, customer_info, faq_alignment, correct_tagging,
+          communication, tone_of_voice, ending, rude_behaviour, hang_up, active_listening,
+          improvement_areas, overall_score, positive_comments, bad_comments,
+          feedback, hold_unhold, coaching_status, evaluation_date
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,
+          $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+          $20,$21,$22,$23,$24,$25,$26,$27
+        )
+        ON CONFLICT (agent_email, ticket_id, evaluation_date, qa_officer)
+        DO UPDATE SET
+          coaching_status   = EXCLUDED.coaching_status,
+          overall_score     = EXCLUDED.overall_score,
+          improvement_areas = EXCLUDED.improvement_areas,
+          positive_comments = EXCLUDED.positive_comments,
+          bad_comments      = EXCLUDED.bad_comments,
+          feedback          = EXCLUDED.feedback,
+          greeting_script   = EXCLUDED.greeting_script,
+          customer_info     = EXCLUDED.customer_info,
+          faq_alignment     = EXCLUDED.faq_alignment,
+          correct_tagging   = EXCLUDED.correct_tagging,
+          communication     = EXCLUDED.communication,
+          tone_of_voice     = EXCLUDED.tone_of_voice,
+          ending            = EXCLUDED.ending,
+          rude_behaviour    = EXCLUDED.rude_behaviour,
+          hang_up           = EXCLUDED.hang_up,
+          active_listening  = EXCLUDED.active_listening
+      `, [
+        r.agent_name || null,
+        (r.agent_email || '').toLowerCase().trim() || null,
+        r.coordinator || null,
+        r.qa_officer || null,
+        r.subject || null,
+        r.phone_number || null,
+        r.ticket_id || null,
+        r.waiting_time || null,
+        r.call_duration || null,
+        parseInt(r.greeting_script) || 0,
+        parseInt(r.customer_info) || 0,
+        parseInt(r.faq_alignment) || 0,
+        parseInt(r.correct_tagging) || 0,
+        parseInt(r.communication) || 0,
+        parseInt(r.tone_of_voice) || 0,
+        parseInt(r.ending) || 0,
+        parseInt(r.rude_behaviour) || 0,
+        parseInt(r.hang_up) || 0,
+        parseInt(r.active_listening) || 0,
+        r.improvement_areas || null,
+        parseFloat(r.overall_score) || null,
+        r.positive_comments || null,
+        r.bad_comments || null,
+        r.feedback || null,
+        r.hold_unhold || null,
+        r.coaching_status || null,
+        evalDate
+      ]);
+      inserted++;
+    }
+    res.json({ success: true, inserted });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get evaluations for logged-in agent (by email)
+app.get('/api/evaluations/mine', authMiddleware(), async (req, res) => {
+  try {
+    const email = req.user.email.toLowerCase().trim();
+    const { rows } = await pool.query(
+      `SELECT * FROM evaluations WHERE LOWER(agent_email) = $1 ORDER BY evaluation_date DESC, id DESC`,
+      [email]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all evaluations (admin/QA only)
+app.get('/api/evaluations', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  try {
+    const { agent_email, qa_officer, from, to } = req.query;
+    let q = `SELECT * FROM evaluations WHERE 1=1`;
+    const params = [];
+    if (agent_email) { params.push(agent_email.toLowerCase()); q += ` AND LOWER(agent_email)=$${params.length}`; }
+    if (qa_officer)  { params.push(qa_officer);  q += ` AND qa_officer=$${params.length}`; }
+    if (from)        { params.push(from);         q += ` AND evaluation_date>=$${params.length}`; }
+    if (to)          { params.push(to);           q += ` AND evaluation_date<=$${params.length}`; }
+    q += ` ORDER BY evaluation_date DESC, id DESC LIMIT 500`;
+    const { rows } = await pool.query(q, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete all evaluations (for re-upload, team_lead only)
+app.delete('/api/evaluations/all', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`TRUNCATE TABLE evaluations RESTART IDENTITY`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/health', async (_, res) => {
   try {
     await pool.query('SELECT 1');
