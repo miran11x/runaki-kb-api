@@ -26,7 +26,7 @@ app.post('/api/auth/login', async (req, res) => {
     const user = r.rows[0];
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name, title: user.title }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name, title: user.title }, process.env.JWT_SECRET, { expiresIn: '365d' });
     await pool.query('UPDATE users SET last_seen=NOW() WHERE id=$1', [user.id]);
     await pool.query(`INSERT INTO active_sessions(user_id,last_ping) VALUES($1,NOW()) ON CONFLICT(user_id) DO UPDATE SET last_ping=NOW()`, [user.id]).catch(() => {});
     await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,'LOGIN',$2)`, [user.id, `Login`]).catch(() => {});
