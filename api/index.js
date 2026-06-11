@@ -564,6 +564,95 @@ app.delete('/api/evaluations/all', authMiddleware(['team_lead']), async (req, re
   }
 });
 
+
+// ─── UPDATE SCRIPTS ──────────────────────────────────────────────────────────
+
+// GET /api/scripts — public, returns published script (agents)
+app.get('/api/scripts/published', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS update_scripts (
+        id SERIAL PRIMARY KEY, topic VARCHAR(300) NOT NULL,
+        sorani TEXT, badini TEXT, arabic TEXT, english TEXT,
+        is_published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    const { rows } = await pool.query(
+      `SELECT * FROM update_scripts WHERE is_published = TRUE LIMIT 1`
+    );
+    res.json(rows[0] || null);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/scripts — all scripts (team lead only)
+app.get('/api/scripts', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM update_scripts ORDER BY updated_at DESC`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/scripts — create new script
+app.post('/api/scripts', authMiddleware(['team_lead']), async (req, res) => {
+  const { topic, sorani, badini, arabic, english } = req.body;
+  if (!topic) return res.status(400).json({ error: 'Topic is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO update_scripts (topic, sorani, badini, arabic, english)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [topic, sorani||null, badini||null, arabic||null, english||null]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/scripts/:id — update script
+app.put('/api/scripts/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const { topic, sorani, badini, arabic, english } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET topic=$1, sorani=$2, badini=$3, arabic=$4, english=$5, updated_at=NOW()
+       WHERE id=$6 RETURNING *`,
+      [topic, sorani||null, badini||null, arabic||null, english||null, req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/scripts/:id/publish — publish this, unpublish all others
+app.patch('/api/scripts/:id/publish', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`UPDATE update_scripts SET is_published=FALSE`);
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET is_published=TRUE, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/scripts/:id/unpublish — archive (unpublish)
+app.patch('/api/scripts/:id/unpublish', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET is_published=FALSE, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/scripts/:id
+app.delete('/api/scripts/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM update_scripts WHERE id=$1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/health', async (_, res) => {
   try {
     await pool.query('SELECT 1');
