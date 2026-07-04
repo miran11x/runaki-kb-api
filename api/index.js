@@ -227,8 +227,43 @@ const {
 } = req.body;
 
   try {
-    const r = await pool.query(`INSERT INTO faqs(category,subcategory,question_en,answer_en,question_ku,answer_ku,tags,is_published,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [category, subcategory||null, question_en, answer_en, question_ku||null, answer_ku||null, tags||null, is_published||false, req.user.id]);
+   const r = await pool.query(`
+  INSERT INTO faqs(
+    category,
+    subcategory,
+    question_en,
+    answer_en,
+    question_ku,
+    answer_ku,
+    question_ba,
+    answer_ba,
+    question_ar,
+    answer_ar,
+    tags,
+    is_published,
+    created_by
+  )
+  VALUES(
+    $1,$2,$3,$4,$5,$6,
+    $7,$8,$9,$10,
+    $11,$12,$13
+  )
+  RETURNING *
+`, [
+  category,
+  subcategory || null,
+  question_en,
+  answer_en,
+  question_ku || null,
+  answer_ku || null,
+  question_ba || null,
+  answer_ba || null,
+  question_ar || null,
+  answer_ar || null,
+  tags || null,
+  is_published || false,
+  req.user.id
+]);
     await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,'CREATE_FAQ',$2)`, [req.user.id, `Created FAQ: "${question_en}"`]);
     res.status(201).json(r.rows[0]);
   } catch { res.status(500).json({ error: 'Server error' }); }
