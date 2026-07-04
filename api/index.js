@@ -211,7 +211,21 @@ app.get('/api/faqs/:id', authMiddleware(), async (req, res) => {
 });
 
 app.post('/api/faqs', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
-  const { category, subcategory, question_en, answer_en, question_ku, answer_ku, tags, is_published } = req.body;
+const {
+  category,
+  subcategory,
+  question_en,
+  answer_en,
+  question_ku,
+  answer_ku,
+  question_ba,
+  answer_ba,
+  question_ar,
+  answer_ar,
+  tags,
+  is_published
+} = req.body;
+
   try {
     const r = await pool.query(`INSERT INTO faqs(category,subcategory,question_en,answer_en,question_ku,answer_ku,tags,is_published,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [category, subcategory||null, question_en, answer_en, question_ku||null, answer_ku||null, tags||null, is_published||false, req.user.id]);
@@ -221,12 +235,61 @@ app.post('/api/faqs', authMiddleware(['qa_officer','team_lead']), async (req, re
 });
 
 app.put('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
-  const { category, subcategory, question_en, answer_en, question_ku, answer_ku, tags, is_published } = req.body;
-  try {
-    const r = await pool.query(`UPDATE faqs SET category=$1,subcategory=$2,question_en=$3,answer_en=$4,question_ku=$5,answer_ku=$6,tags=$7,is_published=$8,updated_by=$9,updated_at=NOW() WHERE id=$10 RETURNING *`,
-      [category, subcategory||null, question_en, answer_en, question_ku||null, answer_ku||null, tags||null, is_published, req.user.id, req.params.id]);
-    res.json(r.rows[0]);
-  } catch { res.status(500).json({ error: 'Server error' }); }
+ const {
+  category,
+  subcategory,
+  question_en,
+  answer_en,
+  question_ku,
+  answer_ku,
+  question_ba,
+  answer_ba,
+  question_ar,
+  answer_ar,
+  tags,
+  is_published
+} = req.body;
+
+ try {
+  const r = await pool.query(`
+    UPDATE faqs SET
+      category=$1,
+      subcategory=$2,
+      question_en=$3,
+      answer_en=$4,
+      question_ku=$5,
+      answer_ku=$6,
+      question_ba=$7,
+      answer_ba=$8,
+      question_ar=$9,
+      answer_ar=$10,
+      tags=$11,
+      is_published=$12,
+      updated_by=$13,
+      updated_at=NOW()
+    WHERE id=$14
+    RETURNING *
+  `, [
+    category,
+    subcategory || null,
+    question_en,
+    answer_en,
+    question_ku || null,
+    answer_ku || null,
+    question_ba || null,
+    answer_ba || null,
+    question_ar || null,
+    answer_ar || null,
+    tags || null,
+    is_published,
+    req.user.id,
+    req.params.id
+  ]);
+
+  res.json(r.rows[0]);
+} catch {
+  res.status(500).json({ error: 'Server error' });
+}
 });
 
 app.patch('/api/faqs/:id/toggle-publish', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
