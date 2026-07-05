@@ -121,19 +121,47 @@ app.get('/api/users/stats/peak-hours', authMiddleware(['team_lead']), async (req
 
 app.patch('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
   const { name, email, role, title, password } = req.body;
-  const updates = []; const vals = [];
-  if (name)     { updates.push(`name=$${updates.length+1}`);  vals.push(name); }
-  if (email)    { updates.push(`email=$${updates.length+1}`); vals.push(email); }
-  if (role)     { updates.push(`role=$${updates.length+1}`);  vals.push(role); }
-  if (title !== undefined) { updates.push(`title=$${updates.length+1}`); vals.push(title); }
-  if (password) {
-    const bcrypt = require('bcryptjs');
-    const hashed = await bcrypt.hash(password, 10);
-    updates.push(`password_hash=$${updates.length+1}`); vals.push(hashed);
+
+  const updates = [];
+  const vals = [];
+
+  if (name) {
+    updates.push(`name=$${updates.length + 1}`);
+    vals.push(name);
   }
-  if (!updates.length) return res.json({ success: true });
+
+  if (email) {
+    updates.push(`email=$${updates.length + 1}`);
+    vals.push(email.toLowerCase());
+  }
+
+  if (role) {
+    updates.push(`role=$${updates.length + 1}`);
+    vals.push(role);
+  }
+
+  if (title !== undefined) {
+    updates.push(`title=$${updates.length + 1}`);
+    vals.push(title);
+  }
+
+  if (password) {
+  const hashed = await bcrypt.hash(password, 10);
+  updates.push(`password=$${updates.length + 1}`);
+  vals.push(hashed);
+}
+
+  if (!updates.length) {
+    return res.json({ success: true });
+  }
+
   vals.push(req.params.id);
-  await pool.query(`UPDATE users SET ${updates.join(',')} WHERE id=$${vals.length}`, vals).catch(() => {});
+
+  await pool.query(
+    `UPDATE users SET ${updates.join(',')} WHERE id=$${vals.length}`,
+    vals
+  );
+
   res.json({ success: true });
 });
 
@@ -662,6 +690,71 @@ app.delete('/api/evaluations/all', authMiddleware(['team_lead']), async (req, re
   }
 });
 
+app.post('/api/faqs/import',
+  authMiddleware(['qa_officer', 'team_lead']),
+  async (req, res) => {
+
+    const rows = req.body.rows;
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({
+        error: 'No FAQs provided'
+      });
+    }
+
+    try {
+      let imported = 0;
+
+      for (const faq of rows) {
+
+        await pool.query(`
+          INSERT INTO faqs (
+            category,
+            subcategory,
+            question_en,
+            answer_en,
+            question_ku,
+            answer_ku,
+            question_ba,
+            answer_ba,
+            question_ar,
+            answer_ar,
+            is_published,
+            created_by
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,
+            $7,$8,$9,$10,$11,$12
+          )
+        `, [
+          faq.category || 'General',
+          faq.subcategory || null,
+          faq.question_en,
+          faq.answer_en,
+          faq.question_ku || null,
+          faq.answer_ku || null,
+          faq.question_ba || null,
+          faq.answer_ba || null,
+          faq.question_ar || null,
+          faq.answer_ar || null,
+          true,
+          req.user.id
+        ]);
+
+        imported++;
+      }
+
+      res.json({
+        success: true,
+        imported
+      });
+
+    } catch (err) {
+      res.status(500).json({
+        error: err.message
+      });
+    }
+});
 
 // ─── UPDATE SCRIPTS ──────────────────────────────────────────────────────────
 
