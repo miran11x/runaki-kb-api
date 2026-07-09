@@ -19,9 +19,21 @@ const authMiddleware = require('../lib/auth');
 
 // POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { identifier, password } = req.body;
   try {
-    const r = await pool.query('SELECT * FROM users WHERE email=$1 AND is_active=true', [email.toLowerCase().trim()]);
+    const r = await pool.query(
+  `
+  SELECT *
+  FROM users
+  WHERE is_active = true
+    AND (
+      LOWER(email) = LOWER($1)
+      OR wave_id = $1
+    )
+  LIMIT 1
+  `,
+  [identifier.trim()]
+);
     if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const user = r.rows[0];
     const ok = await bcrypt.compare(password, user.password);
