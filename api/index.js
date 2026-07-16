@@ -27,8 +27,9 @@ app.post('/api/auth/login', async (req, res) => {
   FROM users
   WHERE is_active = true
     AND (
-      LOWER(email) = LOWER($1)
-      OR wave_id = $1
+      (role = 'agent' AND wave_id = $1)
+      OR
+      (role <> 'agent' AND LOWER(email) = LOWER($1))
     )
   LIMIT 1
   `,
