@@ -379,6 +379,37 @@ app.patch('/api/faqs/:id/view', authMiddleware(), async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post(
+  '/api/faqs/bulk-delete',
+  authMiddleware(['team_lead', 'qa_officer']),
+  async (req, res) => {
+    try {
+      const { ids } = req.body;
+
+      if (!Array.isArray(ids) || !ids.length) {
+        return res.status(400).json({
+          error: 'No IDs supplied'
+        });
+      }
+
+      await pool.query(
+        'DELETE FROM faqs WHERE id = ANY($1)',
+        [ids]
+      );
+
+      res.json({
+        success: true,
+        deleted: ids.length
+      });
+    } catch (err) {
+      console.error(err);
+
+      res.status(500).json({
+        error: 'Failed to delete FAQs'
+      });
+    }
+  }
+);
 app.delete('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
   await pool.query('DELETE FROM faqs WHERE id=$1', [req.params.id]).catch(() => {});
   res.json({ ok: true });
