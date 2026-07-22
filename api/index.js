@@ -129,14 +129,20 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   }
 });
 
+
 app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
   try {
+    console.log('VERIFY USER:', req.user);
+
     const { code } = req.body;
 
     const r = await pool.query(
-      'SELECT mfa_secret FROM users WHERE id = $1',
+      'SELECT id, email, mfa_secret FROM users WHERE id = $1',
       [req.user.id]
     );
+
+    console.log('DB RESULT:', r.rows);
+
 
     if (!r.rows.length || !r.rows[0].mfa_secret) {
       return res.status(400).json({
