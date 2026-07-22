@@ -104,83 +104,25 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   try {
     console.log('STEP 1');
 
-    console.log('STEP 2');
-    console.log(JSON.stringify(req.user));
+    console.log('USER:', req.user);
 
     const secret = speakeasy.generateSecret({
       name: `Runaki-KB (${req.user.email})`
     });
 
-    console.log('STEP 3');
-
-    const updated = await pool.query(
-      `UPDATE users
-       SET mfa_secret = $1
-       WHERE id = $2
-       RETURNING id,email,mfa_secret`,
-      [secret.base32, req.user.id]
-    );
-
-    console.log('STEP 4');
-    console.log(JSON.stringify(updated.rows));
+    console.log('STEP 2');
 
     res.json({
-      secret: secret.base32,
-      qrCode: await QRCode.toDataURL(secret.otpauth_url)
+      success: true,
+      secret: secret.base32
     });
 
   } catch (err) {
-    console.error('MFA ERROR');
-    console.error(err);
+    console.error('MFA SETUP ERROR:', err);
 
     res.status(500).json({
-      error: err.message
-    });
-  }
-});
-
-app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
-  const { token } = req.body;
-
-  try {
-    const r = await pool.query(
-      'SELECT mfa_secret FROM users WHERE id=$1',
-      [req.user.id]
-    );
-
-    if (!r.rows.length || !r.rows[0].mfa_secret) {
-      return res.status(400).json({
-        error: 'MFA secret not found'
-      });
-    }
-
-    const verified = speakeasy.totp.verify({
-      secret: r.rows[0].mfa_secret,
-      encoding: 'base32',
-      token,
-      window: 1
-    });
-
-    if (!verified) {
-      return res.status(400).json({
-        error: 'Invalid code'
-      });
-    }
-
-    await pool.query(
-      'UPDATE users SET mfa_enabled=true WHERE id=$1',
-      [req.user.id]
-    );
-
-    res.json({
-      success: true
-    });
-
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      error: err.message
+      error: err.message,
+      stack: err.stack
     });
   }
 });
