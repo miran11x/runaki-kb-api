@@ -1175,6 +1175,8 @@ app.get('/api/debug/db', async (req, res) => {
   }
 });
 
-module.exports = app;
+app.get('/api/debug/me', authMiddleware(), async (req, res) => {
+  res.json(req.user);
+});
 
 module.exports = app;
