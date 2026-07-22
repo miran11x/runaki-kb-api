@@ -128,6 +128,51 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
     });
   }
 });
+
+p.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
+  try {
+    const { code } = req.body;
+
+    const r = await pool.query(
+      'SELECT mfa_secret FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!r.rows.length || !r.rows[0].mfa_secret) {
+      return res.status(400).json({
+        error: 'MFA secret not found'
+      });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: r.rows[0].mfa_secret,
+      encoding: 'base32',
+      token: code,
+      window: 1
+    });
+
+    if (!verified) {
+      return res.status(400).json({
+        error: 'Invalid MFA code'
+      });
+    }
+
+    await pool.query(
+      `UPDATE users SET mfa_enabled = true WHERE id = $1`,
+      [req.user.id]
+    );
+
+    res.json({
+      success: true
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
 app.post('/api/auth/mfa/login', async (req, res) => {
   try {
     const { challengeToken, code } = req.body;
