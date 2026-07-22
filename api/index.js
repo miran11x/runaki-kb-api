@@ -106,10 +106,19 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
       name: `Runaki-KB (${req.user.email})`
     });
 
-    await pool.query(
-      'UPDATE users SET mfa_secret=$1 WHERE id=$2',
-      [secret.base32, req.user.id]
-    );
+   console.log('req.user:', req.user);
+
+await pool.query(
+  'UPDATE users SET mfa_secret=$1 WHERE id=$2',
+  [secret.base32, req.user.id]
+);
+
+const check = await pool.query(
+  'SELECT id,email,mfa_secret FROM users WHERE id=$1',
+  [req.user.id]
+);
+
+console.log('After update:', check.rows[0]);
 
     const qrCode = await QRCode.toDataURL(secret.otpauth_url);
 
