@@ -102,14 +102,16 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
 
 app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   try {
-    console.log('MFA SETUP START');
-    console.log('REQ USER:', JSON.stringify(req.user));
+    console.log('STEP 1');
+
+    console.log('STEP 2');
+    console.log(JSON.stringify(req.user));
 
     const secret = speakeasy.generateSecret({
       name: `Runaki-KB (${req.user.email})`
     });
 
-    console.log('SECRET GENERATED');
+    console.log('STEP 3');
 
     const updated = await pool.query(
       `UPDATE users
@@ -119,24 +121,17 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
       [secret.base32, req.user.id]
     );
 
-    console.log('ROW COUNT:', updated.rowCount);
-    console.log('ROWS:', JSON.stringify(updated.rows));
-
-    const check = await pool.query(
-      'SELECT id,email,mfa_secret FROM users WHERE id=$1',
-      [req.user.id]
-    );
-
-    console.log('CHECK:', JSON.stringify(check.rows));
-
-    const qrCode = await QRCode.toDataURL(secret.otpauth_url);
+    console.log('STEP 4');
+    console.log(JSON.stringify(updated.rows));
 
     res.json({
       secret: secret.base32,
-      qrCode
+      qrCode: await QRCode.toDataURL(secret.otpauth_url)
     });
+
   } catch (err) {
-    console.error('MFA ERROR:', err);
+    console.error('MFA ERROR');
+    console.error(err);
 
     res.status(500).json({
       error: err.message
