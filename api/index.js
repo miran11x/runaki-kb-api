@@ -101,6 +101,8 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
 });
 
 app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
+  console.log('MFA SETUP VERSION 6262577');
+
   try {
     const secret = speakeasy.generateSecret({
       name: `Runaki-KB (${req.user.email})`
