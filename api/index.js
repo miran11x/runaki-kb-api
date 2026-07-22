@@ -102,27 +102,25 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
 
 app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   try {
-    console.log('STEP 1');
+    const secret = 'TEST_MFA_SECRET';
 
-    console.log('USER:', req.user);
-
-    const secret = speakeasy.generateSecret({
-      name: `Runaki-KB (${req.user.email})`
-    });
-
-    console.log('STEP 2');
+    const updated = await pool.query(
+      `
+      UPDATE users
+      SET mfa_secret = $1
+      WHERE id = $2
+      RETURNING id,email,mfa_secret
+      `,
+      [secret, req.user.id]
+    );
 
     res.json({
       success: true,
-      secret: secret.base32
+      updated: updated.rows
     });
-
   } catch (err) {
-    console.error('MFA SETUP ERROR:', err);
-
     res.status(500).json({
-      error: err.message,
-      stack: err.stack
+      error: err.message
     });
   }
 });
