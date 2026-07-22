@@ -133,7 +133,13 @@ app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
       [req.user.id]
     );
 
-    const verified = speakeasy.totp.verify({
+if (!r.rows.length || !r.rows[0].mfa_secret) {
+  return res.status(400).json({
+    error: 'MFA secret not found'
+  });
+}
+
+const verified = speakeasy.totp.verify({
   secret: r.rows[0].mfa_secret,
   encoding: 'base32',
   token,
