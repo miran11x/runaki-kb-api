@@ -15,6 +15,8 @@ app.use(express.json());
 const pool = require('../lib/db');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
 const authMiddleware = require('../lib/auth');
 
 // POST /api/auth/login
@@ -38,8 +40,36 @@ app.post('/api/auth/login', async (req, res) => {
     if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const user = r.rows[0];
     const ok = await bcrypt.compare(password, user.password);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name, title: user.title }, process.env.JWT_SECRET, { expiresIn: '365d' });
+if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+if (user.mfa_enabled) {
+  const challengeToken = jwt.sign(
+    {
+      userId: user.id,
+      purpose: 'mfa'
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '5m' }
+  );
+
+  return res.json({
+    mfaRequired: true,
+    challengeToken
+  });
+}
+
+const token = jwt.sign(
+  {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    name: user.name,
+    title: user.title
+  },
+  process.env.JWT_SECRET,
+  { expiresIn: '30d' }
+);
+
     await pool.query('UPDATE users SET last_seen=NOW() WHERE id=$1', [user.id]);
     await pool.query(`INSERT INTO active_sessions(user_id,last_ping) VALUES($1,NOW()) ON CONFLICT(user_id) DO UPDATE SET last_ping=NOW()`, [user.id]).catch(() => {});
     await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,'LOGIN',$2)`, [user.id, `Login`]).catch(() => {});
@@ -50,7 +80,10 @@ app.post('/api/auth/login', async (req, res) => {
 
 // GET /api/auth/me
 app.get('/api/auth/me', authMiddleware(), async (req, res) => {
-  const r = await pool.query('SELECT id,name,email,role,title FROM users WHERE id=$1', [req.user.id]).catch(() => null);
+  const r = await pool.query(
+    'SELECT id,name,email,role,title,mfa_enabled FROM users WHERE id=$1',
+    [req.user.id]
+  ).catch(() => null);
   r?.rows[0] ? res.json(r.rows[0]) : res.status(404).json({ error: 'Not found' });
 });
 
@@ -67,11 +100,222 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
+  try {
+    const secret = speakeasy.generateSecret({
+      name: `Runaki-KB (${req.user.email})`
+    });
+
+    await pool.query(
+      'UPDATE users SET mfa_secret=$1 WHERE id=$2',
+      [secret.base32, req.user.id]
+    );
+
+    const qrCode = await QRCode.toDataURL(secret.otpauth_url);
+
+    res.json({
+      secret: secret.base32,
+      qrCode
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
+app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
+  const { token } = req.body;
+
+  try {
+    const r = await pool.query(
+      'SELECT mfa_secret FROM users WHERE id=$1',
+      [req.user.id]
+    );
+
+    const verified = speakeasy.totp.verify({
+  secret: r.rows[0].mfa_secret,
+  encoding: 'base32',
+  token,
+  window: 1
+});
+
+    if (!verified) {
+      return res.status(400).json({
+        error: 'Invalid code'
+      });
+    }
+
+    await pool.query(
+      'UPDATE users SET mfa_enabled=true WHERE id=$1',
+      [req.user.id]
+    );
+
+    res.json({
+      success: true
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+app.post('/api/auth/mfa/login', async (req, res) => {
+  try {
+    const { challengeToken, code } = req.body;
+
+    let payload;
+
+try {
+  payload = jwt.verify(
+    challengeToken,
+    process.env.JWT_SECRET
+  );
+} catch (err) {
+  return res.status(401).json({
+    error: 'Invalid or expired MFA challenge'
+  });
+}
+
+    if (payload.purpose !== 'mfa') {
+      return res.status(401).json({
+        error: 'Invalid challenge token'
+      });
+    }
+
+    const userId = payload.userId;
+
+    const r = await pool.query(
+      'SELECT * FROM users WHERE id=$1 AND is_active=true AND mfa_enabled=true',
+      [userId]
+    );
+
+    if (!r.rows.length) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    const user = r.rows[0];
+
+   const verified = speakeasy.totp.verify({
+  secret: user.mfa_secret,
+  encoding: 'base32',
+  token: code,
+  window: 1
+});
+
+
+    if (!verified) {
+      return res.status(401).json({
+        error: 'Invalid MFA code'
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        name: user.name,
+        title: user.title
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    await pool.query(
+  'UPDATE users SET last_seen=NOW() WHERE id=$1',
+  [user.id]
+).catch(() => {});
+
+await pool.query(
+  `INSERT INTO active_sessions(user_id,last_ping)
+   VALUES($1,NOW())
+   ON CONFLICT(user_id)
+   DO UPDATE SET last_ping=NOW()`,
+  [user.id]
+).catch(() => {});
+
+await pool.query(
+  `INSERT INTO activity_log(user_id,action,details)
+   VALUES($1,'LOGIN',$2)`,
+  [user.id, 'MFA Login']
+).catch(() => {});
+
+await pool.query(
+  `INSERT INTO login_events(user_id)
+   VALUES($1)`,
+  [user.id]
+).catch(() => {});
+
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        title: user.title
+      }
+    });
+
+    
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+
+});
+
+app.post('/api/auth/mfa/disable', authMiddleware(), async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users
+       SET mfa_enabled = false,
+           mfa_secret = null
+       WHERE id = $1`,
+      [req.user.id]
+    );
+
+
+    res.json({
+      success: true
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
+
 // ─── USERS ───────────────────────────────────────────────────────────────────
 app.get('/api/users', authMiddleware(['team_lead']), async (req, res) => {
-  const r = await pool.query('SELECT id,name,email,role,title,is_active,created_at,last_seen FROM users ORDER BY role,name').catch(() => null);
-  r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
+  const r = await pool.query(`
+    SELECT
+      id,
+      name,
+      email,
+      role,
+      title,
+      is_active,
+      mfa_enabled,
+      created_at,
+      last_seen
+    FROM users
+    ORDER BY name
+  `).catch(() => null);
+
+  r
+    ? res.json(r.rows)
+    : res.status(500).json({ error: 'Server error' });
 });
+
 
 app.get('/api/users/stats', authMiddleware(['team_lead']), async (req, res) => {
   try {
