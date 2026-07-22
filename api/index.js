@@ -115,9 +115,12 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
       [secret.base32, req.user.id]
     );
 
+    const qrCode = await QRCode.toDataURL(secret.otpauth_url);
+
     res.json({
       success: true,
-      secret: secret.base32
+      secret: secret.base32,
+      qrCode
     });
   } catch (err) {
     res.status(500).json({
