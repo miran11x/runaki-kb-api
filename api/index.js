@@ -129,7 +129,7 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   }
 });
 
-post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
+app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
   try {
     const { code } = req.body;
 
