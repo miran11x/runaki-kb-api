@@ -112,7 +112,7 @@ const updated = await pool.query(
   `UPDATE users
    SET mfa_secret = $1
    WHERE id = $2
-   RETURNING id,email,mfa_secret`,
+   RETURNING id, email, mfa_secret`,
   [secret.base32, req.user.id]
 );
 
