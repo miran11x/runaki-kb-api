@@ -1,6 +1,13 @@
 const express = require('express');
 const app = express();
 
+console.log('SERVER STARTING');
+console.log('DB_HOST:', !!process.env.DB_HOST);
+console.log('DB_NAME:', !!process.env.DB_NAME);
+console.log('DB_USER:', !!process.env.DB_USER);
+console.log('DB_PASSWORD:', !!process.env.DB_PASSWORD);
+console.log('JWT_SECRET:', !!process.env.JWT_SECRET);
+
 // Vercel-compatible CORS - must handle OPTIONS preflight
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
