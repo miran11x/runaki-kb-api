@@ -108,10 +108,15 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
 
    console.log('req.user:', req.user);
 
-await pool.query(
-  'UPDATE users SET mfa_secret=$1 WHERE id=$2',
+const updated = await pool.query(
+  `UPDATE users
+   SET mfa_secret = $1
+   WHERE id = $2
+   RETURNING id,email,mfa_secret`,
   [secret.base32, req.user.id]
 );
+
+console.log('Updated row:', updated.rows);
 
 const check = await pool.query(
   'SELECT id,email,mfa_secret FROM users WHERE id=$1',
