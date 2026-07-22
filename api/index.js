@@ -1158,4 +1158,23 @@ app.get('/api/health', async (_, res) => {
   }
 });
 
+app.get('/api/debug/db', async (req, res) => {
+  try {
+    const users = await pool.query(`
+      SELECT id, email
+      FROM users
+      ORDER BY id
+      LIMIT 10
+    `);
+
+    res.json(users.rows);
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
+module.exports = app;
+
 module.exports = app;
