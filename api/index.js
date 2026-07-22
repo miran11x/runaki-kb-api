@@ -102,18 +102,25 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
 
 app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   try {
+    console.log('SETUP USER:', req.user);
+
     const secret = speakeasy.generateSecret({
       name: `Runaki-KB (${req.user.email})`
     });
 
-    await pool.query(
+    console.log('GENERATED SECRET:', secret.base32);
+
+    const result = await pool.query(
       `
       UPDATE users
       SET mfa_secret = $1
       WHERE id = $2
+      RETURNING id,email,mfa_secret
       `,
       [secret.base32, req.user.id]
     );
+
+    console.log('UPDATE RESULT:', result.rows);
 
     const qrCode = await QRCode.toDataURL(secret.otpauth_url);
 
@@ -123,12 +130,13 @@ app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
       qrCode
     });
   } catch (err) {
+    console.error('MFA SETUP ERROR:', err);
+
     res.status(500).json({
       error: err.message
     });
   }
 });
-
 
 app.post('/api/auth/mfa/verify', authMiddleware(), async (req, res) => {
   try {
