@@ -480,6 +480,30 @@ app.post('/api/users', authMiddleware(['team_lead']), async (req, res) => {
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ─── FEEDBACK ────────────────────────────────────────────────────────────────
+
+app.get('/api/feedback/my-feedback', authMiddleware(), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM feedback_messages
+      WHERE LOWER(agent_email) = LOWER($1)
+      ORDER BY created_at DESC
+      `,
+      [req.user.email]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
 // ─── FAQS ────────────────────────────────────────────────────────────────────
 app.get('/api/faqs', authMiddleware(), async (req, res) => {
   const r = await pool.query(`SELECT f.*,u.name as created_by_name,u2.name as updated_by_name FROM faqs f LEFT JOIN users u ON u.id=f.created_by LEFT JOIN users u2 ON u2.id=f.updated_by WHERE f.is_published=true ORDER BY f.category,f.subcategory,f.id`).catch(() => null);
