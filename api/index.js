@@ -540,6 +540,23 @@ app.get('/api/faqs/top-viewed', authMiddleware(['team_lead','qa_officer']), asyn
   r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
 });
 
+// PATCH /api/faqs/:id/shortlist — QA officer / team lead only.
+// Toggles whether an FAQ appears in the agent-facing "Shortlisted FAQ's" tab.
+// Lazily adds the column so no manual migration is needed.
+app.patch('/api/faqs/:id/shortlist', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE faqs ADD COLUMN IF NOT EXISTS is_shortlisted BOOLEAN DEFAULT false`);
+    const r = await pool.query(
+      `UPDATE faqs SET is_shortlisted = NOT COALESCE(is_shortlisted, false) WHERE id=$1 RETURNING is_shortlisted`,
+      [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'FAQ not found' });
+    res.json({ is_shortlisted: r.rows[0].is_shortlisted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/faqs/notifications/all', authMiddleware(), async (req, res) => {
   const r = await pool.query(`SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20`).catch(() => null);
   r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
