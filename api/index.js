@@ -19,6 +19,26 @@ const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const authMiddleware = require('../lib/auth');
 
+// GET /api/public/stats
+// Unauthenticated — powers the login screen's live counters.
+// Only returns aggregate counts, never names/emails/per-record data.
+app.get('/api/public/stats', async (req, res) => {
+  try {
+    const [users, faqs, categories] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM users WHERE is_active = true'),
+      pool.query('SELECT COUNT(*) FROM faqs WHERE is_published = true'),
+      pool.query('SELECT COUNT(DISTINCT category) FROM faqs WHERE is_published = true'),
+    ]);
+    res.json({
+      totalUsers: parseInt(users.rows[0].count, 10),
+      totalFAQs: parseInt(faqs.rows[0].count, 10),
+      totalCategories: parseInt(categories.rows[0].count, 10),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   const { identifier, password } = req.body;
@@ -713,6 +733,506 @@ app.delete('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (r
 app.post('/api/faqs/notifications', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
   const { title, message } = req.body;
   const r = await pool.query('INSERT INTO notifications(title,message,created_by) VALUES($1,$2,$3) RETURNING *', [title, message, req.user.id]).catch(() => null);
+  r ? res.json(r.rows[0]) : res.status(500).json({ error: 'Server error' });
+});
+
+// ─── TIPS ─────────────────────────────────────────────────────────────────────
+app.get('/api/tips/latest', authMiddleware(), async (req, res) => {
+  const r = await pool.query(`SELECT t.*,u.name as author FROM daily_tips t LEFT JOIN users u ON u.id=t.created_by WHERE t.is_active=true ORDER BY t.created_at DESC LIMIT 1`).catch(() => null);
+  r ? res.json(r.rows[0] || null) : res.status(500).json({ error: 'Server error' });
+});
+
+app.get('/api/tips', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const r = await pool.query(`SELECT t.*,u.name as author FROM daily_tips t LEFT JOIN users u ON u.id=t.created_by ORDER BY t.created_at DESC LIMIT 20`).catch(() => null);
+  r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
+});
+
+app.post('/api/tips', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const { title, content, category, publish_at } = req.body;
+  if (!title || !content) return res.status(400).json({ error: 'Title and content required' });
+  try {
+    if (!publish_at) await pool.query('UPDATE daily_tips SET is_active=false');
+    const r = await pool.query('INSERT INTO daily_tips(title,content,category,is_active,created_by,publish_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',
+      [title, content, category||'General', !publish_at, req.user.id, publish_at||null]);
+    res.status(201).json(r.rows[0]);
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.patch('/api/tips/:id/toggle', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  try {
+    await pool.query('UPDATE daily_tips SET is_active=false');
+    await pool.query('UPDATE daily_tips SET is_active=true WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/tips/:id', authMiddleware(['team_lead']), async (req, res) => {
+  await pool.query('DELETE FROM daily_tips WHERE id=$1', [req.params.id]).catch(() => {});
+  res.json({ ok: true });
+});
+
+// ─── BOOKMARKS ────────────────────────────────────────────────────────────────
+app.get('/api/bookmarks', authMiddleware(), async (req, res) => {
+  const r = await pool.query(`SELECT f.*,b.created_at as bookmarked_at FROM bookmarks b JOIN faqs f ON f.id=b.faq_id WHERE b.user_id=$1 AND f.is_published=true ORDER BY b.created_at DESC`, [req.user.id]).catch(() => null);
+  r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
+});
+
+app.get('/api/bookmarks/ids', authMiddleware(), async (req, res) => {
+  const r = await pool.query('SELECT faq_id FROM bookmarks WHERE user_id=$1', [req.user.id]).catch(() => null);
+  r ? res.json(r.rows.map(x => x.faq_id)) : res.status(500).json({ error: 'Server error' });
+});
+
+app.post('/api/bookmarks/:faq_id', authMiddleware(), async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT id FROM bookmarks WHERE user_id=$1 AND faq_id=$2', [req.user.id, req.params.faq_id]);
+    if (existing.rows.length > 0) {
+      await pool.query('DELETE FROM bookmarks WHERE user_id=$1 AND faq_id=$2', [req.user.id, req.params.faq_id]);
+      res.json({ bookmarked: false });
+    } else {
+      await pool.query('INSERT INTO bookmarks(user_id,faq_id) VALUES($1,$2)', [req.user.id, req.params.faq_id]);
+      res.json({ bookmarked: true });
+    }
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── RATINGS ─────────────────────────────────────────────────────────────────
+app.post('/api/ratings/:faq_id', authMiddleware(), async (req, res) => {
+  const { helpful } = req.body;
+  try {
+    await pool.query(`INSERT INTO faq_ratings(user_id,faq_id,helpful) VALUES($1,$2,$3) ON CONFLICT(user_id,faq_id) DO UPDATE SET helpful=$3`, [req.user.id, req.params.faq_id, helpful]);
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.get('/api/ratings/mine/all', authMiddleware(), async (req, res) => {
+  const r = await pool.query('SELECT faq_id,helpful FROM faq_ratings WHERE user_id=$1', [req.user.id]).catch(() => null);
+  r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
+});
+
+// ─── ANNOUNCEMENTS ────────────────────────────────────────────────────────────
+app.get('/api/announcements', authMiddleware(), async (req, res) => {
+  const limit = req.user.role === 'team_lead' ? 100 : 5;
+  const r = await pool.query(`SELECT a.*,u.name as created_by_name FROM announcements a LEFT JOIN users u ON u.id=a.created_by ORDER BY a.created_at DESC LIMIT $1`, [limit]).catch(() => null);
+  r ? res.json(r.rows) : res.status(500).json({ error: 'Server error' });
+});
+
+app.post('/api/announcements', authMiddleware(['team_lead']), async (req, res) => {
+  const { title, message, priority } = req.body;
+  try {
+    const r = await pool.query('INSERT INTO announcements(title,message,priority,created_by) VALUES($1,$2,$3,$4) RETURNING *', [title, message, priority||'normal', req.user.id]);
+    await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,'ANNOUNCEMENT',$2)`, [req.user.id, `Sent announcement: ${title}`]);
+    res.json(r.rows[0]);
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/api/announcements/:id', authMiddleware(['team_lead']), async (req, res) => {
+  await pool.query('DELETE FROM announcements WHERE id=$1', [req.params.id]).catch(() => null);
+  res.json({ success: true });
+});
+
+// ─── HEALTH ───────────────────────────────────────────────────────────────────
+
+// ── CALL FLOWS ──────────────────────────────────────────────────────────────
+app.get('/api/callflows', authMiddleware(), async (req, res) => {
+  const r = await pool.query(`SELECT cf.*,u.name as created_by_name FROM call_flows cf LEFT JOIN users u ON u.id=cf.created_by WHERE cf.is_active=true ORDER BY cf.display_order,cf.id`).catch(() => null);
+  res.json(r ? r.rows : []);
+});
+
+app.get('/api/callflows/all', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const r = await pool.query(`SELECT cf.*,u.name as created_by_name FROM call_flows cf LEFT JOIN users u ON u.id=cf.created_by ORDER BY cf.display_order,cf.id`).catch(() => null);
+  res.json(r ? r.rows : []);
+});
+
+app.post('/api/callflows', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const { title, icon, color, description, note, steps, display_order } = req.body;
+  if (!title || !steps) return res.status(400).json({ error: 'title and steps required' });
+  const r = await pool.query(
+    'INSERT INTO call_flows(title,icon,color,description,note,steps,display_order,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+    [title, icon||'📞', color||'#3b82f6', description||'', note||null, JSON.stringify(steps), display_order||0, req.user.id]
+  ).catch(e => ({ error: e.message }));
+  if (r.error) return res.status(500).json({ error: r.error });
+  res.json(r.rows[0]);
+});
+
+app.put('/api/callflows/:id', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const { title, icon, color, description, note, steps, display_order, is_active } = req.body;
+  const r = await pool.query(
+    'UPDATE call_flows SET title=$1,icon=$2,color=$3,description=$4,note=$5,steps=$6,display_order=$7,is_active=$8,updated_at=NOW() WHERE id=$9 RETURNING *',
+    [title, icon, color, description, note||null, JSON.stringify(steps), display_order||0, is_active!==false, req.params.id]
+  ).catch(e => ({ error: e.message }));
+  if (r.error) return res.status(500).json({ error: r.error });
+  res.json(r.rows[0]);
+});
+
+app.delete('/api/callflows/:id', authMiddleware(['team_lead']), async (req, res) => {
+  await pool.query('DELETE FROM call_flows WHERE id=$1', [req.params.id]).catch(() => null);
+  res.json({ success: true });
+});
+
+app.patch('/api/callflows/:id/toggle', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const r = await pool.query('UPDATE call_flows SET is_active=NOT is_active WHERE id=$1 RETURNING is_active', [req.params.id]).catch(() => null);
+  res.json(r ? r.rows[0] : { error: 'failed' });
+});
+
+// ─── MAINTENANCE MODE ────────────────────────────────────────────────────────
+// Stored in DB as a simple key-value in a settings table
+// GET  /api/maintenance        → public, returns { active, message }
+// POST /api/maintenance        → team_lead only, sets active + message
+// Lazy-create settings table if needed
+
+app.get('/api/maintenance', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key   VARCHAR(100) PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    const { rows } = await pool.query(`SELECT value FROM settings WHERE key = 'maintenance'`);
+    if (!rows.length) return res.json({ active: false, message: '' });
+    const data = JSON.parse(rows[0].value);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/maintenance', authMiddleware(['team_lead']), async (req, res) => {
+  const { active, message } = req.body;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key   VARCHAR(100) PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    await pool.query(`
+      INSERT INTO settings (key, value)
+      VALUES ('maintenance', $1)
+      ON CONFLICT (key) DO UPDATE SET value = $1
+    `, [JSON.stringify({ active: !!active, message: message || '' })]);
+    res.json({ success: true, active: !!active });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── EVALUATIONS ─────────────────────────────────────────────────────────────
+
+// Upload evaluations from parsed Excel JSON (sent from frontend)
+app.post('/api/evaluations/upload', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  const rows = req.body.rows;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided' });
+
+  try {
+    let inserted = 0;
+    for (const r of rows) {
+      // Skip rows with no agent email or name
+      if (!r.agent_email && !r.agent_name) continue;
+
+      // Parse date safely
+      let evalDate = null;
+      if (r.evaluation_date) {
+        try { evalDate = new Date(r.evaluation_date).toISOString().split('T')[0]; } catch {}
+      }
+
+      await pool.query(`
+        INSERT INTO evaluations (
+          agent_name, agent_email, coordinator, qa_officer, subject,
+          phone_number, ticket_id, waiting_time, call_duration,
+          greeting_script, customer_info, faq_alignment, correct_tagging,
+          communication, tone_of_voice, ending, rude_behaviour, hang_up, active_listening,
+          improvement_areas, overall_score, positive_comments, bad_comments,
+          feedback, hold_unhold, coaching_status, evaluation_date
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,
+          $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+          $20,$21,$22,$23,$24,$25,$26,$27
+        )
+        ON CONFLICT (agent_email, ticket_id, evaluation_date, qa_officer)
+        DO UPDATE SET
+          coaching_status   = EXCLUDED.coaching_status,
+          overall_score     = EXCLUDED.overall_score,
+          improvement_areas = EXCLUDED.improvement_areas,
+          positive_comments = EXCLUDED.positive_comments,
+          bad_comments      = EXCLUDED.bad_comments,
+          feedback          = EXCLUDED.feedback,
+          greeting_script   = EXCLUDED.greeting_script,
+          customer_info     = EXCLUDED.customer_info,
+          faq_alignment     = EXCLUDED.faq_alignment,
+          correct_tagging   = EXCLUDED.correct_tagging,
+          communication     = EXCLUDED.communication,
+          tone_of_voice     = EXCLUDED.tone_of_voice,
+          ending            = EXCLUDED.ending,
+          rude_behaviour    = EXCLUDED.rude_behaviour,
+          hang_up           = EXCLUDED.hang_up,
+          active_listening  = EXCLUDED.active_listening
+      `, [
+        r.agent_name || null,
+        (r.agent_email || '').toLowerCase().trim() || null,
+        r.coordinator || null,
+        r.qa_officer || null,
+        r.subject || null,
+        r.phone_number || null,
+        r.ticket_id || null,
+        r.waiting_time || null,
+        r.call_duration || null,
+        parseInt(r.greeting_script) || 0,
+        parseInt(r.customer_info) || 0,
+        parseInt(r.faq_alignment) || 0,
+        parseInt(r.correct_tagging) || 0,
+        parseInt(r.communication) || 0,
+        parseInt(r.tone_of_voice) || 0,
+        parseInt(r.ending) || 0,
+        parseInt(r.rude_behaviour) || 0,
+        parseInt(r.hang_up) || 0,
+        parseInt(r.active_listening) || 0,
+        r.improvement_areas || null,
+        parseFloat(r.overall_score) || null,
+        r.positive_comments || null,
+        r.bad_comments || null,
+        r.feedback || null,
+        r.hold_unhold || null,
+        r.coaching_status || null,
+        evalDate
+      ]);
+      inserted++;
+    }
+    res.json({ success: true, inserted });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get evaluations for logged-in agent (by email)
+app.get('/api/evaluations/mine', authMiddleware(), async (req, res) => {
+  try {
+    const email = req.user.email.toLowerCase().trim();
+    const { rows } = await pool.query(
+      `SELECT * FROM evaluations WHERE LOWER(agent_email) = $1 ORDER BY evaluation_date DESC, id DESC`,
+      [email]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all evaluations (admin/QA only)
+app.get('/api/evaluations', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
+  try {
+    const { agent_email, qa_officer, from, to } = req.query;
+    let q = `SELECT * FROM evaluations WHERE 1=1`;
+    const params = [];
+    if (agent_email) { params.push(agent_email.toLowerCase()); q += ` AND LOWER(agent_email)=$${params.length}`; }
+    if (qa_officer)  { params.push(qa_officer);  q += ` AND qa_officer=$${params.length}`; }
+    if (from)        { params.push(from);         q += ` AND evaluation_date>=$${params.length}`; }
+    if (to)          { params.push(to);           q += ` AND evaluation_date<=$${params.length}`; }
+    q += ` ORDER BY evaluation_date DESC, id DESC LIMIT 500`;
+    const { rows } = await pool.query(q, params);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete all evaluations (for re-upload, team_lead only)
+app.delete('/api/evaluations/all', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`TRUNCATE TABLE evaluations RESTART IDENTITY`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/faqs/import',
+  authMiddleware(['qa_officer', 'team_lead']),
+  async (req, res) => {
+
+    const rows = req.body.rows;
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({
+        error: 'No FAQs provided'
+      });
+    }
+
+    try {
+      let imported = 0;
+
+      for (const faq of rows) {
+
+        await pool.query(`
+          INSERT INTO faqs (
+            category,
+            subcategory,
+            question_en,
+            answer_en,
+            question_ku,
+            answer_ku,
+            question_ba,
+            answer_ba,
+            question_ar,
+            answer_ar,
+            is_published,
+            created_by
+          )
+          VALUES (
+            $1,$2,$3,$4,$5,$6,
+            $7,$8,$9,$10,$11,$12
+          )
+        `, [
+          faq.category || 'General',
+          faq.subcategory || null,
+          faq.question_en,
+          faq.answer_en,
+          faq.question_ku || null,
+          faq.answer_ku || null,
+          faq.question_ba || null,
+          faq.answer_ba || null,
+          faq.question_ar || null,
+          faq.answer_ar || null,
+          true,
+          req.user.id
+        ]);
+
+        imported++;
+      }
+
+      res.json({
+        success: true,
+        imported
+      });
+
+    } catch (err) {
+      res.status(500).json({
+        error: err.message
+      });
+    }
+});
+
+// ─── UPDATE SCRIPTS ──────────────────────────────────────────────────────────
+
+// GET /api/scripts — public, returns published script (agents)
+app.get('/api/scripts/published', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS update_scripts (
+        id SERIAL PRIMARY KEY, topic VARCHAR(300) NOT NULL,
+        sorani TEXT, badini TEXT, arabic TEXT, english TEXT,
+        is_published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    const { rows } = await pool.query(
+      `SELECT * FROM update_scripts WHERE is_published = TRUE LIMIT 1`
+    );
+    res.json(rows[0] || null);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/scripts — all scripts (team lead only)
+app.get('/api/scripts', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM update_scripts ORDER BY updated_at DESC`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/scripts — create new script
+app.post('/api/scripts', authMiddleware(['team_lead']), async (req, res) => {
+  const { topic, sorani, badini, arabic, english } = req.body;
+  if (!topic) return res.status(400).json({ error: 'Topic is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO update_scripts (topic, sorani, badini, arabic, english)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [topic, sorani||null, badini||null, arabic||null, english||null]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/scripts/:id — update script
+app.put('/api/scripts/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const { topic, sorani, badini, arabic, english } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET topic=$1, sorani=$2, badini=$3, arabic=$4, english=$5, updated_at=NOW()
+       WHERE id=$6 RETURNING *`,
+      [topic, sorani||null, badini||null, arabic||null, english||null, req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/scripts/:id/publish — publish this, unpublish all others
+app.patch('/api/scripts/:id/publish', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`UPDATE update_scripts SET is_published=FALSE`);
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET is_published=TRUE, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/scripts/:id/unpublish — archive (unpublish)
+app.patch('/api/scripts/:id/unpublish', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE update_scripts SET is_published=FALSE, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/scripts/:id
+app.delete('/api/scripts/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM update_scripts WHERE id=$1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/health', async (_, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'connected', time: new Date() });
+  } catch(e) {
+    res.status(500).json({ status: 'error', db: 'failed', error: e.message });
+  }
+});
+
+app.get('/api/debug/db', async (req, res) => {
+  try {
+    const users = await pool.query(`
+      SELECT id, email
+      FROM users
+      ORDER BY id
+      LIMIT 10
+    `);
+
+    res.json(users.rows);
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
+app.get('/api/debug/me', authMiddleware(), async (req, res) => {
+  res.json(req.user);
+});
+
+module.exports = app;req.user.id]).catch(() => null);
   r ? res.json(r.rows[0]) : res.status(500).json({ error: 'Server error' });
 });
 
