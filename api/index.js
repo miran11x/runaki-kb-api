@@ -349,6 +349,7 @@ app.get('/api/users', authMiddleware(['team_lead']), async (req, res) => {
       email,
       role,
       title,
+      wave_id,
       is_active,
       mfa_enabled,
       created_at,
@@ -423,7 +424,7 @@ app.get('/api/users/stats/peak-hours', authMiddleware(['team_lead']), async (req
 
 
 app.patch('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
-  const { name, email, role, title, password } = req.body;
+  const { name, email, role, title, password, wave_id } = req.body;
 
   const updates = [];
   const vals = [];
@@ -448,6 +449,11 @@ app.patch('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
     vals.push(title);
   }
 
+  if (wave_id !== undefined) {
+    updates.push(`wave_id=$${updates.length + 1}`);
+    vals.push(wave_id ? wave_id.toString().trim() : null);
+  }
+
   if (password) {
   const hashed = await bcrypt.hash(password, 10);
   updates.push(`password=$${updates.length + 1}`);
@@ -460,12 +466,16 @@ app.patch('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
 
   vals.push(req.params.id);
 
-  await pool.query(
-    `UPDATE users SET ${updates.join(',')} WHERE id=$${vals.length}`,
-    vals
-  );
-
-  res.json({ success: true });
+  try {
+    await pool.query(
+      `UPDATE users SET ${updates.join(',')} WHERE id=$${vals.length}`,
+      vals
+    );
+    res.json({ success: true });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That Wave ID or email is already in use.' });
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 app.patch('/api/users/:id/reset-password', authMiddleware(['team_lead']), async (req, res) => {
@@ -492,12 +502,131 @@ app.delete('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => 
 });
 
 app.post('/api/users', authMiddleware(['team_lead']), async (req, res) => {
-  const { name, email, password, role, title } = req.body;
+  const { name, email, password, role, title, wave_id } = req.body;
   try {
     const hash = await bcrypt.hash(password, 10);
-    const r = await pool.query('INSERT INTO users(name,email,password,role,title) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,role,title', [name, email.toLowerCase(), hash, role, title]);
+    const waveId = wave_id ? wave_id.toString().trim() : null;
+    const r = await pool.query(
+      'INSERT INTO users(name,email,password,role,title,wave_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,name,email,role,title,wave_id',
+      [name, email.toLowerCase(), hash, role, title, waveId]
+    );
     res.status(201).json(r.rows[0]);
-  } catch { res.status(500).json({ error: 'Server error' }); }
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That Wave ID or email is already in use.' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/users/bulk-agents — team_lead only.
+// Creates many agent accounts at once. Each agent logs in with their Wave ID
+// as the identifier and a password of the form Wave@<waveId> — matching the
+// existing login query, which already resolves agents by wave_id. Re-running
+// this with the same list is safe: existing wave_ids are skipped, not
+// duplicated or overwritten.
+app.post('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, res) => {
+  const { agents } = req.body;
+  if (!Array.isArray(agents) || !agents.length) {
+    return res.status(400).json({ error: 'agents array required' });
+  }
+  const created = [];
+  const skipped = [];
+  const failed = [];
+  for (const a of agents) {
+    const waveId = (a.wave_id || '').toString().trim();
+    const name = (a.name || '').toString().trim();
+    const title = (a.title || '').toString().trim();
+    const providedEmail = (a.email || '').toString().trim().toLowerCase();
+    if (!waveId || !name) {
+      failed.push({ ...a, reason: 'missing name or wave_id' });
+      continue;
+    }
+    const email = providedEmail || `wave${waveId}@agents.runaki.local`;
+    try {
+      const exists = await pool.query('SELECT id FROM users WHERE wave_id=$1 OR email=$2', [waveId, email]);
+      if (exists.rows.length) {
+        skipped.push({ wave_id: waveId, name, reason: 'wave_id or email already exists' });
+        continue;
+      }
+      const password = `Wave@${waveId}`;
+      const hash = await bcrypt.hash(password, 10);
+      await pool.query(
+        `INSERT INTO users(name, email, password, role, title, wave_id)
+         VALUES ($1,$2,$3,'agent',$4,$5)`,
+        [name, email, hash, title || null, waveId]
+      );
+      created.push({ wave_id: waveId, name, email });
+    } catch (err) {
+      failed.push({ wave_id: waveId, name, reason: err.message });
+    }
+  }
+  res.json({ created, skipped, failed, summary: `${created.length} created, ${skipped.length} skipped, ${failed.length} failed` });
+});
+
+// DELETE /api/users/bulk-agents — team_lead only.
+// Deletes every account with role='agent'. Deliberately scoped to agents
+// only — never touches qa_officer or team_lead accounts, even if called
+// carelessly. Requires an explicit confirm:true in the body as a safety
+// latch against an accidental call.
+app.delete('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, res) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: 'Refusing to bulk-delete without confirm:true in the request body.' });
+  }
+  try {
+    const r = await pool.query(`DELETE FROM users WHERE role='agent' RETURNING id`);
+    res.json({ deletedCount: r.rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users/bulk-staff — team_lead only.
+// Bulk-creates management/QA/coordinator/trainer accounts. These get FAQ
+// editor access (role: qa_officer), never admin — admin stays exclusive to
+// team_lead. Unlike agents, staff have no Wave ID, so each account gets a
+// strong randomly generated password instead of a predictable pattern —
+// these accounts can edit official FAQ content, so a guessable password
+// scheme is a real risk here in a way it isn't for read-mostly agent
+// accounts. The plaintext passwords are only ever returned in this one
+// response, never stored or logged — copy them out before closing this.
+const crypto = require('crypto');
+function generateStaffPassword() {
+  return crypto.randomBytes(9).toString('base64').replace(/[+/=]/g, c => ({ '+': '8', '/': '9', '=': '' }[c]));
+}
+
+app.post('/api/users/bulk-staff', authMiddleware(['team_lead']), async (req, res) => {
+  const { staff } = req.body;
+  if (!Array.isArray(staff) || !staff.length) {
+    return res.status(400).json({ error: 'staff array required' });
+  }
+  const created = [];
+  const skipped = [];
+  const failed = [];
+  for (const s of staff) {
+    const name = (s.name || '').toString().trim();
+    const email = (s.email || '').toString().trim().toLowerCase();
+    const title = (s.title || '').toString().trim();
+    if (!name || !email) {
+      failed.push({ ...s, reason: 'missing name or email' });
+      continue;
+    }
+    try {
+      const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
+      if (exists.rows.length) {
+        skipped.push({ name, email, reason: 'email already exists' });
+        continue;
+      }
+      const password = generateStaffPassword();
+      const hash = await bcrypt.hash(password, 10);
+      await pool.query(
+        `INSERT INTO users(name, email, password, role, title) VALUES ($1,$2,$3,'qa_officer',$4)`,
+        [name, email, hash, title || null]
+      );
+      created.push({ name, email, title, password });
+    } catch (err) {
+      failed.push({ name, email, reason: err.message });
+    }
+  }
+  res.json({ created, skipped, failed, summary: `${created.length} created, ${skipped.length} skipped, ${failed.length} failed` });
 });
 
 // ─── FEEDBACK ────────────────────────────────────────────────────────────────
