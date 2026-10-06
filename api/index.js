@@ -572,8 +572,16 @@ app.delete('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, 
     return res.status(400).json({ error: 'Refusing to bulk-delete without confirm:true in the request body.' });
   }
   try {
-    const r = await pool.query(`DELETE FROM users WHERE role='agent' RETURNING id`);
-    res.json({ deletedCount: r.rows.length });
+    // LOWER(TRIM()) so this can't silently match 0 rows over a stray case or
+    // whitespace difference in how 'agent' was originally stored.
+    const before = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    const r = await pool.query(`DELETE FROM users WHERE LOWER(TRIM(role)) = 'agent' RETURNING id`);
+    const after = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    res.json({
+      deletedCount: r.rows.length,
+      matchedBefore: parseInt(before.rows[0].count, 10),
+      remainingAfter: parseInt(after.rows[0].count, 10),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
