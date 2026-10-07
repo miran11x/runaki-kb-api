@@ -496,6 +496,30 @@ app.patch('/api/users/:id/toggle', authMiddleware(['team_lead']), async (req, re
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
+// NOTE: these two routes must stay registered BEFORE '/api/users/:id' below —
+// Express matches routes top-to-bottom, and ':id' matches any single path
+// segment, including the literal word "bulk-agents". Registered in the wrong
+// order, every call here would silently hit the single-user delete instead
+// (id="bulk-agents" matches no real user, so it would appear to succeed
+// while deleting nothing — exactly the bug this ordering fixes).
+app.delete('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, res) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: 'Refusing to bulk-delete without confirm:true in the request body.' });
+  }
+  try {
+    const before = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    const r = await pool.query(`DELETE FROM users WHERE LOWER(TRIM(role)) = 'agent' RETURNING id`);
+    const after = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    res.json({
+      deletedCount: r.rows.length,
+      matchedBefore: parseInt(before.rows[0].count, 10),
+      remainingAfter: parseInt(after.rows[0].count, 10),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.delete('/api/users/:id', authMiddleware(['team_lead']), async (req, res) => {
   await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]).catch(() => {});
   res.json({ ok: true });
@@ -560,31 +584,6 @@ app.post('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, re
     }
   }
   res.json({ created, skipped, failed, summary: `${created.length} created, ${skipped.length} skipped, ${failed.length} failed` });
-});
-
-// DELETE /api/users/bulk-agents — team_lead only.
-// Deletes every account with role='agent'. Deliberately scoped to agents
-// only — never touches qa_officer or team_lead accounts, even if called
-// carelessly. Requires an explicit confirm:true in the body as a safety
-// latch against an accidental call.
-app.delete('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, res) => {
-  if (req.body?.confirm !== true) {
-    return res.status(400).json({ error: 'Refusing to bulk-delete without confirm:true in the request body.' });
-  }
-  try {
-    // LOWER(TRIM()) so this can't silently match 0 rows over a stray case or
-    // whitespace difference in how 'agent' was originally stored.
-    const before = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
-    const r = await pool.query(`DELETE FROM users WHERE LOWER(TRIM(role)) = 'agent' RETURNING id`);
-    const after = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
-    res.json({
-      deletedCount: r.rows.length,
-      matchedBefore: parseInt(before.rows[0].count, 10),
-      remainingAfter: parseInt(after.rows[0].count, 10),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // POST /api/users/bulk-staff — team_lead only.
