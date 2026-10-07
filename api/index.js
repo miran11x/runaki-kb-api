@@ -506,17 +506,57 @@ app.delete('/api/users/bulk-agents', authMiddleware(['team_lead']), async (req, 
   if (req.body?.confirm !== true) {
     return res.status(400).json({ error: 'Refusing to bulk-delete without confirm:true in the request body.' });
   }
+  const client = await pool.connect();
   try {
-    const before = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
-    const r = await pool.query(`DELETE FROM users WHERE LOWER(TRIM(role)) = 'agent' RETURNING id`);
-    const after = await pool.query(`SELECT COUNT(*) FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    await client.query('BEGIN');
+
+    const agentRows = await client.query(`SELECT id FROM users WHERE LOWER(TRIM(role)) = 'agent'`);
+    const agentIds = agentRows.rows.map(r => r.id);
+
+    if (!agentIds.length) {
+      await client.query('COMMIT');
+      return res.json({ deletedCount: 0, matchedBefore: 0, remainingAfter: 0, clearedTables: [] });
+    }
+
+    // Find every table with a foreign key pointing at users(id) and clear
+    // matching rows there first. This is discovered from the database
+    // itself rather than a hardcoded table list, so it automatically covers
+    // activity_log, bookmarks, ratings, feedback, etc. — including any
+    // table added later that references users, without this code needing
+    // to be updated every time a new feature adds a user_id column.
+    const fkResult = await client.query(`
+      SELECT tc.table_name, kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND ccu.table_name = 'users'
+        AND ccu.column_name = 'id'
+        AND tc.table_name <> 'users'
+    `);
+
+    const clearedTables = [];
+    for (const { table_name, column_name } of fkResult.rows) {
+      await client.query(`DELETE FROM "${table_name}" WHERE "${column_name}" = ANY($1::int[])`, [agentIds]);
+      clearedTables.push(table_name);
+    }
+
+    const r = await client.query(`DELETE FROM users WHERE id = ANY($1::int[]) RETURNING id`, [agentIds]);
+    await client.query('COMMIT');
+
     res.json({
       deletedCount: r.rows.length,
-      matchedBefore: parseInt(before.rows[0].count, 10),
-      remainingAfter: parseInt(after.rows[0].count, 10),
+      matchedBefore: agentIds.length,
+      remainingAfter: agentIds.length - r.rows.length,
+      clearedTables,
     });
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
