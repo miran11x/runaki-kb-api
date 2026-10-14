@@ -9,7 +9,8 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
   next();
 });
-app.use(express.json());
+// FAQ imports carry long multi-language answers, so allow bigger JSON bodies than the 100kb default
+app.use(express.json({ limit: '4mb' }));
 
 // ─── AUTH ────────────────────────────────────────────────────────────────────
 const pool = require('../lib/db');
@@ -18,6 +19,72 @@ const bcrypt = require('bcryptjs');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const authMiddleware = require('../lib/auth');
+
+// ─── FAQ HELPERS ─────────────────────────────────────────────────────────────
+
+// Adds the is_shortlisted flag and widens a few text columns (tags was
+// VARCHAR(255) and subcategory VARCHAR(100) — too small for imported
+// "key terms"). All statements are idempotent and safe to repeat.
+let faqSchemaReady = null;
+function ensureFaqSchema() {
+  if (!faqSchemaReady) {
+    faqSchemaReady = (async () => {
+      await pool.query(`ALTER TABLE faqs ADD COLUMN IF NOT EXISTS is_shortlisted BOOLEAN DEFAULT false`);
+      for (const col of ['tags', 'subcategory', 'third_level']) {
+        try { await pool.query(`ALTER TABLE faqs ALTER COLUMN ${col} TYPE TEXT`); } catch (e) { /* column missing or already fine */ }
+      }
+    })().catch(err => { faqSchemaReady = null; throw err; });
+  }
+  return faqSchemaReady;
+}
+
+// Deletes FAQs plus every row in other tables that references them
+// (bookmarks, ratings, ...), discovered from the database itself so a newly
+// added table can't break deletion. All-or-nothing: runs in one transaction.
+async function deleteFaqsWithDependents(ids) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const fk = await client.query(`
+      SELECT tc.table_name, kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND ccu.table_name = 'faqs' AND ccu.column_name = 'id'
+        AND tc.table_name <> 'faqs'
+    `);
+    const clearedTables = [];
+    for (const { table_name, column_name } of fk.rows) {
+      await client.query(`DELETE FROM "${table_name}" WHERE "${column_name}" = ANY($1::int[])`, [ids]);
+      clearedTables.push(table_name);
+    }
+    const r = await client.query(`DELETE FROM faqs WHERE id = ANY($1::int[]) RETURNING id`, [ids]);
+    await client.query('COMMIT');
+    return { deleted: r.rows.length, clearedTables };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// The master sheet says "Service Request"; the app's category is "Service Requests".
+const FAQ_CATEGORY_ALIASES = {
+  'inquiries': 'Inquiries', 'inquiry': 'Inquiries',
+  'billing complaints': 'Billing Complaints', 'billing complaint': 'Billing Complaints',
+  'general complaints': 'General Complaints', 'general complaint': 'General Complaints',
+  'service request': 'Service Requests', 'service requests': 'Service Requests',
+  'feedback & others': 'Feedback & Others', 'feedback and others': 'Feedback & Others',
+  'new updates': 'New Updates',
+};
+function normalizeFaqCategory(c) {
+  const raw = (c || '').toString().trim();
+  return FAQ_CATEGORY_ALIASES[raw.toLowerCase()] || raw || 'General';
+}
 
 // GET /api/public/stats
 // Unauthenticated — powers the login screen's live counters.
@@ -771,10 +838,13 @@ const {
   question_ar,
   answer_ar,
   tags,
-  is_published
+  is_published,
+  third_level,
+  is_shortlisted
 } = req.body;
 
   try {
+   await ensureFaqSchema();
    const r = await pool.query(`
   INSERT INTO faqs(
     category,
@@ -789,12 +859,15 @@ const {
     answer_ar,
     tags,
     is_published,
-    created_by
+    created_by,
+    third_level,
+    is_shortlisted
   )
   VALUES(
     $1,$2,$3,$4,$5,$6,
     $7,$8,$9,$10,
-    $11,$12,$13
+    $11,$12,$13,
+    $14,$15
   )
   RETURNING *
 `, [
@@ -810,7 +883,9 @@ const {
   answer_ar || null,
   tags || null,
   is_published || false,
-  req.user.id
+  req.user.id,
+  third_level || null,
+  is_shortlisted === true
 ]);
     await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,'CREATE_FAQ',$2)`, [req.user.id, `Created FAQ: "${question_en}"`]);
     res.status(201).json(r.rows[0]);
@@ -830,10 +905,13 @@ app.put('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req,
   question_ar,
   answer_ar,
   tags,
-  is_published
+  is_published,
+  third_level,
+  is_shortlisted
 } = req.body;
 
  try {
+  await ensureFaqSchema();
   const r = await pool.query(`
     UPDATE faqs SET
       category=$1,
@@ -849,6 +927,8 @@ app.put('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req,
       tags=$11,
       is_published=$12,
       updated_by=$13,
+      third_level=COALESCE($15, third_level),
+      is_shortlisted=COALESCE($16, is_shortlisted),
       updated_at=NOW()
     WHERE id=$14
     RETURNING *
@@ -866,7 +946,9 @@ app.put('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req,
     tags || null,
     is_published,
     req.user.id,
-    req.params.id
+    req.params.id,
+    third_level === undefined ? null : third_level,
+    typeof is_shortlisted === 'boolean' ? is_shortlisted : null
   ]);
 
   res.json(r.rows[0]);
@@ -891,35 +973,27 @@ app.post(
   authMiddleware(['team_lead', 'qa_officer']),
   async (req, res) => {
     try {
-      const { ids } = req.body;
-
-      if (!Array.isArray(ids) || !ids.length) {
-        return res.status(400).json({
-          error: 'No IDs supplied'
-        });
+      const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter(Number.isInteger);
+      if (!ids.length) {
+        return res.status(400).json({ error: 'No IDs supplied' });
       }
-
-      await pool.query(
-        'DELETE FROM faqs WHERE id = ANY($1)',
-        [ids]
-      );
-
-      res.json({
-        success: true,
-        deleted: ids.length
-      });
+      const result = await deleteFaqsWithDependents(ids);
+      res.json({ success: true, deleted: result.deleted, clearedTables: result.clearedTables });
     } catch (err) {
       console.error(err);
-
-      res.status(500).json({
-        error: 'Failed to delete FAQs'
-      });
+      res.status(500).json({ error: err.message || 'Failed to delete FAQs' });
     }
   }
 );
 app.delete('/api/faqs/:id', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
-  await pool.query('DELETE FROM faqs WHERE id=$1', [req.params.id]).catch(() => {});
-  res.json({ ok: true });
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid FAQ id' });
+    const result = await deleteFaqsWithDependents([id]);
+    res.json({ ok: true, deleted: result.deleted });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to delete FAQ' });
+  }
 });
 
 // Notify
@@ -1241,69 +1315,87 @@ app.delete('/api/evaluations/all', authMiddleware(['team_lead']), async (req, re
   }
 });
 
+// POST /api/faqs/import — qa_officer / team_lead.
+// rows: normalized FAQ objects (the editor converts the Excel sheet first).
+// shortlisted:true puts every imported FAQ in the "Shortlisted FAQ's" tab only
+// (and keeps it out of the general category lists). Re-importing is safe:
+// an FAQ whose English question already exists in the same list is skipped.
 app.post('/api/faqs/import',
   authMiddleware(['qa_officer', 'team_lead']),
   async (req, res) => {
-
     const rows = req.body.rows;
+    const shortlisted = req.body.shortlisted === true;
 
     if (!Array.isArray(rows) || rows.length === 0) {
-      return res.status(400).json({
-        error: 'No FAQs provided'
-      });
+      return res.status(400).json({ error: 'No FAQs provided' });
     }
 
+    const clean = v => {
+      if (v === undefined || v === null) return null;
+      const t = v.toString().trim();
+      return t === '' || t === '-' ? null : t;
+    };
+
+    const client = await pool.connect();
     try {
+      await ensureFaqSchema();
+      await client.query('BEGIN');
+
+      const existing = await client.query(
+        `SELECT LOWER(TRIM(question_en)) AS q FROM faqs WHERE COALESCE(is_shortlisted,false) = $1`,
+        [shortlisted]
+      );
+      const seen = new Set(existing.rows.map(r => r.q));
+
       let imported = 0;
+      const skipped = [];
 
-      for (const faq of rows) {
+      for (let i = 0; i < rows.length; i++) {
+        const faq = rows[i] || {};
+        const question = clean(faq.question_en);
+        const answer = clean(faq.answer_en);
+        if (!question || !answer) {
+          skipped.push({ row: i + 1, reason: 'missing English question or answer' });
+          continue;
+        }
+        const key = question.toLowerCase();
+        if (seen.has(key)) {
+          skipped.push({ row: i + 1, question, reason: 'already exists' });
+          continue;
+        }
+        seen.add(key);
 
-        await pool.query(`
+        await client.query(`
           INSERT INTO faqs (
-            category,
-            subcategory,
-            question_en,
-            answer_en,
-            question_ku,
-            answer_ku,
-            question_ba,
-            answer_ba,
-            question_ar,
-            answer_ar,
-            is_published,
-            created_by
-          )
-          VALUES (
-            $1,$2,$3,$4,$5,$6,
-            $7,$8,$9,$10,$11,$12
-          )
+            category, subcategory, third_level,
+            question_en, answer_en,
+            question_ku, answer_ku,
+            question_ba, answer_ba,
+            question_ar, answer_ar,
+            tags, is_published, is_shortlisted, created_by
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13,$14)
         `, [
-          faq.category || 'General',
-          faq.subcategory || null,
-          faq.question_en,
-          faq.answer_en,
-          faq.question_ku || null,
-          faq.answer_ku || null,
-          faq.question_ba || null,
-          faq.answer_ba || null,
-          faq.question_ar || null,
-          faq.answer_ar || null,
-          true,
+          normalizeFaqCategory(faq.category),
+          clean(faq.subcategory),
+          clean(faq.third_level),
+          question, answer,
+          clean(faq.question_ku), clean(faq.answer_ku),
+          clean(faq.question_ba), clean(faq.answer_ba),
+          clean(faq.question_ar), clean(faq.answer_ar),
+          clean(faq.tags),
+          shortlisted,
           req.user.id
         ]);
-
         imported++;
       }
 
-      res.json({
-        success: true,
-        imported
-      });
-
+      await client.query('COMMIT');
+      res.json({ success: true, imported, skipped });
     } catch (err) {
-      res.status(500).json({
-        error: err.message
-      });
+      await client.query('ROLLBACK').catch(() => {});
+      res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
     }
 });
 
