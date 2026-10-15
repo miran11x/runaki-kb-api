@@ -2206,4 +2206,123 @@ app.patch('/api/td/feedback/:id', authMiddleware(['team_lead']), async (req, res
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+// ─────────────────────────────────────────────────────────────
+// Reports for the merged tools (team lead only). Days are Erbil time (UTC+3).
+// ─────────────────────────────────────────────────────────────
+const dateOrNull = v => (/^\d{4}-\d{2}-\d{2}$/.test(v || '') ? v : null);
+// SQL fragment limiting column `col` to the local-date range given as $1 (from) and $2 (to), both optional
+const RANGE = col => `($1::date IS NULL OR ${col} + INTERVAL '3 hours' >= $1::date) AND ($2::date IS NULL OR ${col} + INTERVAL '3 hours' < $2::date + 1)`;
+
+app.get('/api/td/reports/dashboard', authMiddleware(['team_lead']), async (req, res) => {
+  const f = dateOrNull(req.query.from), t = dateOrNull(req.query.to);
+  const P = [f, t];
+  const CR = RANGE('copied_at'), ZR = RANGE('looked_up_at');
+  try {
+    await ensureTdTables(); await ensureZoneTables();
+    const q = (sql, params = P) => pool.query(sql, params).then(r => r.rows);
+    const [agents, copies, zones, active, topCats, share, board, topZones, trend, heat] = await Promise.all([
+      q(`SELECT COUNT(*)::int AS n FROM users WHERE LOWER(role)='agent' AND is_active = TRUE`, []),
+      q(`SELECT COUNT(*)::int AS n FROM td_copy_log WHERE ${CR}`),
+      q(`SELECT COUNT(*)::int AS n FROM td_zone_log WHERE ${ZR}`),
+      q(`SELECT COUNT(DISTINCT uid)::int AS n FROM (
+           SELECT user_id AS uid FROM td_copy_log WHERE user_id IS NOT NULL AND ${CR}
+           UNION ALL SELECT user_id FROM td_zone_log WHERE user_id IS NOT NULL AND ${ZR}) x`),
+      q(`SELECT COALESCE(level2, level1) AS name, COUNT(*)::int AS count FROM td_copy_log WHERE ${CR} GROUP BY 1 ORDER BY 2 DESC LIMIT 8`),
+      q(`SELECT COALESCE(level1,'(deleted)') AS name, COUNT(*)::int AS value FROM td_copy_log WHERE ${CR} GROUP BY 1 ORDER BY 2 DESC`),
+      q(`SELECT COALESCE(user_name,'(unknown)') AS name, COUNT(*)::int AS count FROM td_copy_log WHERE ${CR} GROUP BY 1 ORDER BY 2 DESC LIMIT 10`),
+      q(`SELECT neighborhood || ' (' || city || ')' AS name, COUNT(*)::int AS count FROM td_zone_log WHERE neighborhood IS NOT NULL AND ${ZR} GROUP BY 1 ORDER BY 2 DESC LIMIT 8`),
+      q(`SELECT d AS day, SUM(c)::int AS copies, SUM(z)::int AS zones FROM (
+           SELECT to_char(copied_at + INTERVAL '3 hours','YYYY-MM-DD') AS d, 1 AS c, 0 AS z FROM td_copy_log WHERE ${CR}
+           UNION ALL SELECT to_char(looked_up_at + INTERVAL '3 hours','YYYY-MM-DD'), 0, 1 FROM td_zone_log WHERE ${ZR}) x
+         GROUP BY d ORDER BY d`),
+      q(`SELECT EXTRACT(DOW FROM ts + INTERVAL '3 hours')::int AS dow, EXTRACT(HOUR FROM ts + INTERVAL '3 hours')::int AS hr, COUNT(*)::int AS n FROM (
+           SELECT copied_at AS ts FROM td_copy_log WHERE ${CR}
+           UNION ALL SELECT looked_up_at FROM td_zone_log WHERE ${ZR}) x GROUP BY 1, 2`),
+    ]);
+    const grid = Array.from({ length: 7 }, () => Array(24).fill(0));
+    heat.forEach(h => { grid[h.dow][h.hr] = h.n; });
+    res.json({
+      agents: agents[0].n, copies: copies[0].n, zones: zones[0].n, activeAgents: active[0].n,
+      topCategories: topCats, share, leaderboard: board, topZones, trend: trend.slice(-60), heatmap: grid,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/td/reports/digest', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureTdTables(); await ensureZoneTables();
+    const q = (sql, p = []) => pool.query(sql, p).then(r => r.rows);
+    const [topCats, topZones, counts, inactive, idle] = await Promise.all([
+      q(`SELECT COALESCE(level2, level1) AS name, COUNT(*)::int AS count FROM td_copy_log WHERE copied_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5`),
+      q(`SELECT neighborhood || ' (' || city || ')' AS name, COUNT(*)::int AS count FROM td_zone_log WHERE neighborhood IS NOT NULL AND looked_up_at > NOW() - INTERVAL '7 days' GROUP BY 1 ORDER BY 2 DESC LIMIT 5`),
+      q(`SELECT
+           (SELECT COUNT(*)::int FROM td_copy_log WHERE copied_at > NOW() - INTERVAL '7 days') AS copies,
+           (SELECT COUNT(*)::int FROM td_copy_log WHERE copied_at > NOW() - INTERVAL '14 days' AND copied_at <= NOW() - INTERVAL '7 days') AS copies_prev,
+           (SELECT COUNT(*)::int FROM td_zone_log WHERE looked_up_at > NOW() - INTERVAL '7 days') AS zones,
+           (SELECT COUNT(*)::int FROM td_zone_log WHERE looked_up_at > NOW() - INTERVAL '14 days' AND looked_up_at <= NOW() - INTERVAL '7 days') AS zones_prev`),
+      q(`SELECT id, name, last_seen FROM users WHERE LOWER(role)='agent' AND is_active = TRUE AND (last_seen IS NULL OR last_seen < NOW() - INTERVAL '7 days') ORDER BY last_seen NULLS FIRST LIMIT 200`),
+      q(`SELECT u.id, u.name, u.last_seen FROM users u
+         WHERE LOWER(u.role)='agent' AND u.is_active = TRUE AND u.last_seen >= NOW() - INTERVAL '7 days'
+           AND NOT EXISTS (SELECT 1 FROM td_copy_log c WHERE c.user_id = u.id AND c.copied_at > NOW() - INTERVAL '7 days')
+           AND NOT EXISTS (SELECT 1 FROM td_zone_log z WHERE z.user_id = u.id AND z.looked_up_at > NOW() - INTERVAL '7 days')
+         ORDER BY u.name LIMIT 200`),
+    ]);
+    res.json({ topCategories: topCats, topZones, totals: counts[0], inactive, idle });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Combined copy + zone-lookup log, newest first
+app.get('/api/td/reports/activity', authMiddleware(['team_lead']), async (req, res) => {
+  const f = dateOrNull(req.query.from), t = dateOrNull(req.query.to);
+  const type = ['copy', 'zone'].includes(req.query.type) ? req.query.type : 'all';
+  const search = (req.query.q || '').toString().trim();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  try {
+    await ensureTdTables(); await ensureZoneTables();
+    const base = `
+      SELECT 'copy' AS type, user_name, concat_ws(' → ', level1, level2, level3) AS detail, copied_at AS at FROM td_copy_log WHERE ${RANGE('copied_at')}
+      UNION ALL
+      SELECT 'zone', user_name, neighborhood || ' (' || city || ')' || COALESCE(' — Zone ' || zone, ''), looked_up_at FROM td_zone_log WHERE ${RANGE('looked_up_at')}`;
+    const where = `WHERE ($3 = 'all' OR type = $3) AND ($4 = '' OR user_name ILIKE '%' || $4 || '%' OR detail ILIKE '%' || $4 || '%')`;
+    const rows = await pool.query(`SELECT * FROM (${base}) x ${where} ORDER BY at DESC LIMIT ${limit}`, [f, t, type, search]);
+    const total = await pool.query(`SELECT COUNT(*)::int AS n FROM (${base}) x ${where}`, [f, t, type, search]);
+    res.json({ rows: rows.rows, total: total.rows[0].n });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Duplicate log rows = same person + same item inside the same minute. dry=true only counts.
+app.post('/api/td/maintenance/duplicates', authMiddleware(['team_lead']), async (req, res) => {
+  const dry = req.body.dry !== false;
+  try {
+    await ensureTdTables(); await ensureZoneTables();
+    const copyCond = `a.id > b.id AND a.user_name IS NOT DISTINCT FROM b.user_name AND a.level1 IS NOT DISTINCT FROM b.level1
+      AND a.level2 IS NOT DISTINCT FROM b.level2 AND a.level3 IS NOT DISTINCT FROM b.level3
+      AND date_trunc('minute', a.copied_at) = date_trunc('minute', b.copied_at)`;
+    const zoneCond = `a.id > b.id AND a.user_name IS NOT DISTINCT FROM b.user_name AND a.city IS NOT DISTINCT FROM b.city
+      AND a.neighborhood IS NOT DISTINCT FROM b.neighborhood AND a.zone IS NOT DISTINCT FROM b.zone
+      AND date_trunc('minute', a.looked_up_at) = date_trunc('minute', b.looked_up_at)`;
+    let copies, zones;
+    if (dry) {
+      copies = (await pool.query(`SELECT COUNT(*)::int AS n FROM td_copy_log a WHERE EXISTS (SELECT 1 FROM td_copy_log b WHERE ${copyCond})`)).rows[0].n;
+      zones = (await pool.query(`SELECT COUNT(*)::int AS n FROM td_zone_log a WHERE EXISTS (SELECT 1 FROM td_zone_log b WHERE ${zoneCond})`)).rows[0].n;
+    } else {
+      copies = (await pool.query(`DELETE FROM td_copy_log a USING td_copy_log b WHERE ${copyCond}`)).rowCount;
+      zones = (await pool.query(`DELETE FROM td_zone_log a USING td_zone_log b WHERE ${zoneCond}`)).rowCount;
+    }
+    res.json({ dry, copies, zones });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Everything the merged tools store, as one JSON file (descriptions, zones, logs, flags, feedback)
+app.get('/api/td/export', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureTdTables(); await ensureZoneTables(); await ensureFeedbackTables();
+    const all = t => pool.query(`SELECT * FROM ${t} ORDER BY id`).then(r => r.rows);
+    const [categories, zones, copy_log, zone_log, flags, feedback] = await Promise.all(
+      ['td_categories', 'td_zones', 'td_copy_log', 'td_zone_log', 'td_flags', 'td_feedback'].map(all));
+    res.json({ exported_at: new Date().toISOString(), categories, zones, copy_log, zone_lookup_log: zone_log, flags, feedback });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = app;
