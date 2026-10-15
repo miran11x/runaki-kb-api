@@ -2469,7 +2469,7 @@ app.post('/api/search-log', authMiddleware(), async (req, res) => {
 const safeQ = async (sql, params, fallback = []) => {
   try { return (await pool.query(sql, params)).rows; } catch (e) { console.error('dashboard query failed:', e.message); return fallback; }
 };
-const rangeDays = req => Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 7));
+const rangeDays = req => (req.query.days === 'all' ? 36500 : Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 7)));
 const SCORE = `NULLIF(regexp_replace(overall_score::text, '[^0-9.]', '', 'g'), '')::numeric`;
 
 app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) => {
@@ -2543,7 +2543,7 @@ app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) 
 });
 
 app.get('/api/admin/agents/:id', authMiddleware(['team_lead']), async (req, res) => {
-  const d = Math.min(180, Math.max(1, parseInt(req.query.days, 10) || 30));
+  const d = req.query.days === 'all' ? 36500 : Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30));
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: 'Bad id' });
   try {
