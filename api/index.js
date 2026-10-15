@@ -2478,7 +2478,6 @@ const safeQ = async (sql, params, fallback = []) => {
   try { return (await pool.query(sql, params)).rows; } catch (e) { console.error('dashboard query failed:', e.message); return fallback; }
 };
 const rangeDays = req => (req.query.days === 'all' ? 36500 : Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 7)));
-const SCORE = `NULLIF(regexp_replace(overall_score::text, '[^0-9.]', '', 'g'), '')::numeric`;
 
 app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) => {
   const d = rangeDays(req);
@@ -2500,7 +2499,7 @@ app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) 
       safeQ(`SELECT COUNT(*)::int AS n FROM search_log WHERE results=0 AND created_at > NOW()-${I}`, [d]),
       safeQ(`SELECT COUNT(*)::int AS n FROM td_feedback WHERE status='new'`, []),
       safeQ(`SELECT COUNT(*)::int AS n FROM td_flags WHERE status='open'`, []),
-      safeQ(`SELECT COUNT(*)::int AS n FROM evaluations WHERE LOWER(COALESCE(coaching_status,'')) NOT IN ('done','completed','closed') AND COALESCE(coaching_status,'') <> ''`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM qa_evals WHERE feedback_needed = true AND LOWER(COALESCE(coaching_status,'')) NOT LIKE '%deliver%' AND eval_date > NOW()-INTERVAL '60 days'`, []),
       safeQ(`SELECT to_char((le.logged_in_at + INTERVAL '3 hours')::date,'YYYY-MM-DD') AS day, COUNT(*)::int AS logins, COUNT(DISTINCT le.user_id)::int AS people
              FROM login_events le JOIN users u ON u.id=le.user_id WHERE u.role='agent' AND le.logged_in_at > NOW()-${I} GROUP BY 1 ORDER BY 1`, [d]),
       safeQ(`SELECT day, SUM(copies)::int AS copies, SUM(zones)::int AS zones FROM (
@@ -2517,8 +2516,8 @@ app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) 
                (SELECT COUNT(*)::int FROM td_zone_log z WHERE z.user_id=u.id AND z.looked_up_at > NOW()-${I}) AS zones,
                (SELECT COUNT(*)::int FROM search_log sl WHERE sl.user_id=u.id AND sl.created_at > NOW()-${I}) AS searches,
                (SELECT COUNT(*)::int FROM td_feedback f WHERE f.user_id=u.id AND f.created_at > NOW()-${I}) AS feedback,
-               (SELECT ROUND(AVG(${SCORE}),1) FROM evaluations e WHERE LOWER(e.agent_email)=LOWER(u.email) AND e.evaluation_date > (NOW()-${I})::date) AS avg_score,
-               (SELECT COUNT(*)::int FROM evaluations e WHERE LOWER(e.agent_email)=LOWER(u.email) AND e.evaluation_date > (NOW()-${I})::date) AS evals,
+               (SELECT ROUND(AVG(e.final_score)*100.0/33,1) FROM qa_evals e WHERE e.wave_id=u.wave_id AND e.eval_date > NOW()-${I}) AS avg_score,
+               (SELECT COUNT(*)::int FROM qa_evals e WHERE e.wave_id=u.wave_id AND e.eval_date > NOW()-${I}) AS evals,
                EXISTS (SELECT 1 FROM active_sessions s WHERE s.user_id=u.id AND s.last_ping > NOW()-INTERVAL '5 minutes') AS online
              FROM users u WHERE u.role='agent' AND u.is_active=true ORDER BY u.name`, [d]),
       safeQ(`SELECT id, question_en, category, views FROM faqs WHERE is_published=true ORDER BY views DESC NULLS LAST LIMIT 8`, []),
@@ -2527,8 +2526,8 @@ app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) 
              FROM faq_ratings fr JOIN faqs f ON f.id=fr.faq_id GROUP BY f.id, f.question_en, f.category
              HAVING COUNT(*) FILTER (WHERE fr.helpful=false) > 0 ORDER BY down DESC, up ASC LIMIT 8`, []),
       safeQ(`SELECT LOWER(query) AS query, COUNT(*)::int AS times, COUNT(DISTINCT user_id)::int AS people FROM search_log WHERE results=0 AND created_at > NOW()-${I} GROUP BY 1 ORDER BY times DESC, query LIMIT 15`, [d]),
-      safeQ(`SELECT to_char(evaluation_date,'YYYY-MM-DD') AS day, ROUND(AVG(${SCORE}),1) AS avg, COUNT(*)::int AS n FROM evaluations WHERE evaluation_date > (NOW()-${I})::date GROUP BY 1 ORDER BY 1`, [d]),
-      safeQ(`SELECT agent_name, ROUND(AVG(${SCORE}),1) AS avg, COUNT(*)::int AS n FROM evaluations WHERE evaluation_date > (NOW()-${I})::date GROUP BY agent_name HAVING COUNT(*) >= 1 ORDER BY avg ASC NULLS LAST LIMIT 8`, [d]),
+      safeQ(`SELECT to_char(eval_date,'YYYY-MM-DD') AS day, ROUND(AVG(final_score)*100.0/33,1) AS avg, COUNT(*)::int AS n FROM qa_evals WHERE eval_date > NOW()-${I} GROUP BY 1 ORDER BY 1`, [d]),
+      safeQ(`SELECT agent_name, ROUND(AVG(final_score)*100.0/33,1) AS avg, COUNT(*)::int AS n FROM qa_evals WHERE eval_date > NOW()-${I} GROUP BY agent_name HAVING COUNT(*) >= 2 ORDER BY avg ASC NULLS LAST LIMIT 8`, [d]),
       safeQ(`SELECT u.id, u.name, u.wave_id, u.last_seen FROM users u WHERE u.role='agent' AND u.is_active=true
              AND NOT EXISTS (SELECT 1 FROM login_events le WHERE le.user_id=u.id AND le.logged_in_at > NOW()-INTERVAL '7 days') ORDER BY u.last_seen ASC NULLS FIRST LIMIT 15`, []),
       safeQ(`SELECT id, user_name, rating, message, created_at FROM td_feedback WHERE status='new' ORDER BY created_at DESC LIMIT 5`, []),
@@ -2564,8 +2563,8 @@ app.get('/api/admin/agents/:id', authMiddleware(['team_lead']), async (req, res)
       safeQ(`SELECT level1, level2, level3, copied_at FROM td_copy_log WHERE user_id=$1 AND copied_at > NOW()-${I} ORDER BY copied_at DESC LIMIT 15`, [id, d]),
       safeQ(`SELECT city, neighborhood, zone, looked_up_at FROM td_zone_log WHERE user_id=$1 AND looked_up_at > NOW()-${I} ORDER BY looked_up_at DESC LIMIT 15`, [id, d]),
       safeQ(`SELECT query, results, created_at FROM search_log WHERE user_id=$1 AND created_at > NOW()-${I} ORDER BY created_at DESC LIMIT 15`, [id, d]),
-      safeQ(`SELECT to_char(evaluation_date,'YYYY-MM-DD') AS day, ${SCORE} AS score, qa_officer, coaching_status, improvement_areas
-             FROM evaluations WHERE LOWER(agent_email) = (SELECT LOWER(email) FROM users WHERE id=$1) ORDER BY evaluation_date DESC, id DESC LIMIT 10`, [id]),
+      safeQ(`SELECT to_char(eval_date,'YYYY-MM-DD') AS day, ROUND(final_score*100.0/33,0) AS score, qa_officer, coaching_status, subject AS improvement_areas
+             FROM qa_evals WHERE wave_id = (SELECT wave_id FROM users WHERE id=$1) ORDER BY eval_date DESC, id DESC LIMIT 10`, [id]),
       safeQ(`SELECT rating, message, status, created_at FROM td_feedback WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5`, [id]),
       safeQ(`SELECT f.question_en, f.category FROM faq_views fv JOIN faqs f ON f.id=fv.faq_id WHERE fv.user_id=$1 ORDER BY fv.faq_id DESC LIMIT 8`, [id]),
     ]);
@@ -2574,5 +2573,7 @@ app.get('/api/admin/agents/:id', authMiddleware(['team_lead']), async (req, res)
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+require('../lib/qaEvals')(app, pool, authMiddleware);
 
 module.exports = app;
