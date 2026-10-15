@@ -2433,4 +2433,138 @@ app.delete('/api/contact-reasons/:id', authMiddleware(['team_lead']), async (req
 });
 
 
+// ─────────────────────────────────────────────────────────────
+// Admin dashboard (team lead): everything agents do, in one call
+// ─────────────────────────────────────────────────────────────
+let searchLogReady = null;
+function ensureSearchLog() {
+  if (!searchLogReady) {
+    searchLogReady = pool.query(`
+      CREATE TABLE IF NOT EXISTS search_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        query TEXT NOT NULL,
+        results INTEGER NOT NULL DEFAULT 0,
+        source TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_search_log_time ON search_log (created_at DESC);
+    `).catch(err => { searchLogReady = null; throw err; });
+  }
+  return searchLogReady;
+}
+
+app.post('/api/search-log', authMiddleware(), async (req, res) => {
+  const query = tdClean(req.body.query);
+  if (!query || query.length < 2) return res.json({ ok: true });
+  try {
+    await ensureSearchLog();
+    await pool.query('INSERT INTO search_log (user_id, query, results, source) VALUES ($1,$2,$3,$4)',
+      [req.user.id, query.slice(0, 200), Math.max(0, parseInt(req.body.results, 10) || 0), tdClean(req.body.source) || null]);
+  } catch { /* logging must never break search */ }
+  res.json({ ok: true });
+});
+
+// one failing query must not take the whole dashboard down
+const safeQ = async (sql, params, fallback = []) => {
+  try { return (await pool.query(sql, params)).rows; } catch (e) { console.error('dashboard query failed:', e.message); return fallback; }
+};
+const rangeDays = req => Math.min(90, Math.max(1, parseInt(req.query.days, 10) || 7));
+const SCORE = `NULLIF(regexp_replace(overall_score::text, '[^0-9.]', '', 'g'), '')::numeric`;
+
+app.get('/api/admin/dashboard', authMiddleware(['team_lead']), async (req, res) => {
+  const d = rangeDays(req);
+  try {
+    await Promise.all([ensureTdTables(), ensureZoneTables(), ensureFeedbackTables(), ensureSearchLog()]).catch(() => {});
+    const I = `make_interval(days => $1::int)`;
+    const [
+      agentsTotal, online, loginsRange, activeUsersRange, inactive, copies, zones, searches, noResult, feedbackNew, flagsOpen, coachingPending,
+      dailyLogins, dailyTools, peak, agents, topFaqs, neverViewed, unhelpful, noResultTop, evalDaily, evalLow, inactiveList, recentFeedback,
+    ] = await Promise.all([
+      safeQ(`SELECT COUNT(*)::int AS n FROM users WHERE role='agent' AND is_active=true`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM active_sessions s JOIN users u ON u.id=s.user_id WHERE u.role='agent' AND s.last_ping > NOW()-INTERVAL '5 minutes'`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM login_events le JOIN users u ON u.id=le.user_id WHERE u.role='agent' AND le.logged_in_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(DISTINCT le.user_id)::int AS n FROM login_events le JOIN users u ON u.id=le.user_id WHERE u.role='agent' AND le.logged_in_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(*)::int AS n FROM users u WHERE u.role='agent' AND u.is_active=true AND NOT EXISTS (SELECT 1 FROM login_events le WHERE le.user_id=u.id AND le.logged_in_at > NOW()-INTERVAL '7 days')`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM td_copy_log WHERE copied_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(*)::int AS n FROM td_zone_log WHERE looked_up_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(*)::int AS n FROM search_log WHERE created_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(*)::int AS n FROM search_log WHERE results=0 AND created_at > NOW()-${I}`, [d]),
+      safeQ(`SELECT COUNT(*)::int AS n FROM td_feedback WHERE status='new'`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM td_flags WHERE status='open'`, []),
+      safeQ(`SELECT COUNT(*)::int AS n FROM evaluations WHERE LOWER(COALESCE(coaching_status,'')) NOT IN ('done','completed','closed') AND COALESCE(coaching_status,'') <> ''`, []),
+      safeQ(`SELECT to_char((le.logged_in_at + INTERVAL '3 hours')::date,'YYYY-MM-DD') AS day, COUNT(*)::int AS logins, COUNT(DISTINCT le.user_id)::int AS people
+             FROM login_events le JOIN users u ON u.id=le.user_id WHERE u.role='agent' AND le.logged_in_at > NOW()-${I} GROUP BY 1 ORDER BY 1`, [d]),
+      safeQ(`SELECT day, SUM(copies)::int AS copies, SUM(zones)::int AS zones FROM (
+               SELECT to_char((copied_at + INTERVAL '3 hours')::date,'YYYY-MM-DD') AS day, COUNT(*) AS copies, 0 AS zones FROM td_copy_log WHERE copied_at > NOW()-${I} GROUP BY 1
+               UNION ALL
+               SELECT to_char((looked_up_at + INTERVAL '3 hours')::date,'YYYY-MM-DD'), 0, COUNT(*) FROM td_zone_log WHERE looked_up_at > NOW()-${I} GROUP BY 1
+             ) t GROUP BY day ORDER BY day`, [d]),
+      safeQ(`SELECT EXTRACT(HOUR FROM (logged_in_at + INTERVAL '3 hours'))::int AS hour, COUNT(*)::int AS logins FROM login_events WHERE logged_in_at > NOW()-${I} GROUP BY 1 ORDER BY 1`, [d]),
+      safeQ(`SELECT u.id, u.name, u.wave_id, u.title, u.last_seen,
+               (SELECT COUNT(*)::int FROM login_events le WHERE le.user_id=u.id AND le.logged_in_at > NOW()-${I}) AS logins,
+               (SELECT COUNT(DISTINCT faq_id)::int FROM faq_views fv WHERE fv.user_id=u.id) AS faqs_viewed,
+               (SELECT COUNT(*)::int FROM bookmarks b WHERE b.user_id=u.id) AS bookmarks,
+               (SELECT COUNT(*)::int FROM td_copy_log c WHERE c.user_id=u.id AND c.copied_at > NOW()-${I}) AS copies,
+               (SELECT COUNT(*)::int FROM td_zone_log z WHERE z.user_id=u.id AND z.looked_up_at > NOW()-${I}) AS zones,
+               (SELECT COUNT(*)::int FROM search_log sl WHERE sl.user_id=u.id AND sl.created_at > NOW()-${I}) AS searches,
+               (SELECT COUNT(*)::int FROM td_feedback f WHERE f.user_id=u.id AND f.created_at > NOW()-${I}) AS feedback,
+               (SELECT ROUND(AVG(${SCORE}),1) FROM evaluations e WHERE LOWER(e.agent_email)=LOWER(u.email) AND e.evaluation_date > (NOW()-${I})::date) AS avg_score,
+               (SELECT COUNT(*)::int FROM evaluations e WHERE LOWER(e.agent_email)=LOWER(u.email) AND e.evaluation_date > (NOW()-${I})::date) AS evals,
+               EXISTS (SELECT 1 FROM active_sessions s WHERE s.user_id=u.id AND s.last_ping > NOW()-INTERVAL '5 minutes') AS online
+             FROM users u WHERE u.role='agent' AND u.is_active=true ORDER BY u.name`, [d]),
+      safeQ(`SELECT id, question_en, category, views FROM faqs WHERE is_published=true ORDER BY views DESC NULLS LAST LIMIT 8`, []),
+      safeQ(`SELECT id, question_en, category FROM faqs WHERE is_published=true AND COALESCE(views,0)=0 ORDER BY id DESC LIMIT 10`, []),
+      safeQ(`SELECT f.id, f.question_en, f.category, COUNT(*) FILTER (WHERE fr.helpful=false)::int AS down, COUNT(*) FILTER (WHERE fr.helpful=true)::int AS up
+             FROM faq_ratings fr JOIN faqs f ON f.id=fr.faq_id GROUP BY f.id, f.question_en, f.category
+             HAVING COUNT(*) FILTER (WHERE fr.helpful=false) > 0 ORDER BY down DESC, up ASC LIMIT 8`, []),
+      safeQ(`SELECT LOWER(query) AS query, COUNT(*)::int AS times, COUNT(DISTINCT user_id)::int AS people FROM search_log WHERE results=0 AND created_at > NOW()-${I} GROUP BY 1 ORDER BY times DESC, query LIMIT 15`, [d]),
+      safeQ(`SELECT to_char(evaluation_date,'YYYY-MM-DD') AS day, ROUND(AVG(${SCORE}),1) AS avg, COUNT(*)::int AS n FROM evaluations WHERE evaluation_date > (NOW()-${I})::date GROUP BY 1 ORDER BY 1`, [d]),
+      safeQ(`SELECT agent_name, ROUND(AVG(${SCORE}),1) AS avg, COUNT(*)::int AS n FROM evaluations WHERE evaluation_date > (NOW()-${I})::date GROUP BY agent_name HAVING COUNT(*) >= 1 ORDER BY avg ASC NULLS LAST LIMIT 8`, [d]),
+      safeQ(`SELECT u.id, u.name, u.wave_id, u.last_seen FROM users u WHERE u.role='agent' AND u.is_active=true
+             AND NOT EXISTS (SELECT 1 FROM login_events le WHERE le.user_id=u.id AND le.logged_in_at > NOW()-INTERVAL '7 days') ORDER BY u.last_seen ASC NULLS FIRST LIMIT 15`, []),
+      safeQ(`SELECT id, user_name, rating, message, created_at FROM td_feedback WHERE status='new' ORDER BY created_at DESC LIMIT 5`, []),
+    ]);
+    const n = r => (r[0] ? r[0].n : 0);
+    res.json({
+      days: d,
+      kpis: {
+        agents: n(agentsTotal), online: n(online), logins: n(loginsRange), activeAgents: n(activeUsersRange), inactive7: n(inactive),
+        copies: n(copies), zones: n(zones), searches: n(searches), noResult: n(noResult),
+        feedbackNew: n(feedbackNew), flagsOpen: n(flagsOpen), coachingPending: n(coachingPending),
+      },
+      series: { logins: dailyLogins, tools: dailyTools, peak },
+      agents,
+      content: { topFaqs, neverViewed, unhelpful, noResult: noResultTop },
+      quality: { daily: evalDaily, lowest: evalLow },
+      attention: { inactive: inactiveList, feedback: recentFeedback },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/agents/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const d = Math.min(180, Math.max(1, parseInt(req.query.days, 10) || 30));
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'Bad id' });
+  try {
+    await Promise.all([ensureTdTables(), ensureZoneTables(), ensureFeedbackTables(), ensureSearchLog()]).catch(() => {});
+    const I = `make_interval(days => $2::int)`;
+    const [user, logins, activity, copies, zones, searches, evals, feedback, faqs] = await Promise.all([
+      safeQ(`SELECT id, name, email, wave_id, title, role, last_seen, is_active FROM users WHERE id=$1`, [id]),
+      safeQ(`SELECT to_char((logged_in_at + INTERVAL '3 hours')::date,'YYYY-MM-DD') AS day, COUNT(*)::int AS logins FROM login_events WHERE user_id=$1 AND logged_in_at > NOW()-${I} GROUP BY 1 ORDER BY 1`, [id, d]),
+      safeQ(`SELECT action, details, created_at FROM activity_log WHERE user_id=$1 ORDER BY created_at DESC LIMIT 15`, [id]),
+      safeQ(`SELECT level1, level2, level3, copied_at FROM td_copy_log WHERE user_id=$1 AND copied_at > NOW()-${I} ORDER BY copied_at DESC LIMIT 15`, [id, d]),
+      safeQ(`SELECT city, neighborhood, zone, looked_up_at FROM td_zone_log WHERE user_id=$1 AND looked_up_at > NOW()-${I} ORDER BY looked_up_at DESC LIMIT 15`, [id, d]),
+      safeQ(`SELECT query, results, created_at FROM search_log WHERE user_id=$1 AND created_at > NOW()-${I} ORDER BY created_at DESC LIMIT 15`, [id, d]),
+      safeQ(`SELECT to_char(evaluation_date,'YYYY-MM-DD') AS day, ${SCORE} AS score, qa_officer, coaching_status, improvement_areas
+             FROM evaluations WHERE LOWER(agent_email) = (SELECT LOWER(email) FROM users WHERE id=$1) ORDER BY evaluation_date DESC, id DESC LIMIT 10`, [id]),
+      safeQ(`SELECT rating, message, status, created_at FROM td_feedback WHERE user_id=$1 ORDER BY created_at DESC LIMIT 5`, [id]),
+      safeQ(`SELECT f.question_en, f.category FROM faq_views fv JOIN faqs f ON f.id=fv.faq_id WHERE fv.user_id=$1 ORDER BY fv.faq_id DESC LIMIT 8`, [id]),
+    ]);
+    if (!user.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ days: d, user: user[0], logins, activity, copies, zones, searches, evaluations: evals, feedback, faqs });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 module.exports = app;
