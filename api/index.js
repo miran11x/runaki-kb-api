@@ -2113,4 +2113,97 @@ app.post('/api/td/zone-lookup', authMiddleware(), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+// ─────────────────────────────────────────────────────────────
+// My Stats + agent feedback (merged from the old tool)
+// ─────────────────────────────────────────────────────────────
+let fbTablesReady = null;
+function ensureFeedbackTables() {
+  if (!fbTablesReady) {
+    fbTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS td_feedback (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER,
+          user_name TEXT,
+          rating INTEGER,
+          message TEXT,
+          category_request TEXT,
+          status TEXT NOT NULL DEFAULT 'new',
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_td_feedback_user ON td_feedback (user_id);
+      `);
+    })().catch(err => { fbTablesReady = null; throw err; });
+  }
+  return fbTablesReady;
+}
+
+// Personal numbers for the signed-in user. Days are counted in Erbil time (UTC+3).
+app.get('/api/td/my-stats', authMiddleware(), async (req, res) => {
+  try {
+    await ensureTdTables();
+    await ensureZoneTables();
+    const OFFSET = 3 * 3600 * 1000;
+    const dayKey = ms => new Date(ms + OFFSET).toISOString().slice(0, 10);
+    const copies = await pool.query(
+      `SELECT to_char(copied_at + INTERVAL '3 hours', 'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM td_copy_log WHERE user_id = $1 GROUP BY d`, [req.user.id]);
+    const zones = await pool.query(
+      `SELECT to_char(looked_up_at + INTERVAL '3 hours', 'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM td_zone_log WHERE user_id = $1 GROUP BY d`, [req.user.id]);
+    const perDay = new Map();
+    let copyTotal = 0, zoneTotal = 0;
+    copies.rows.forEach(r => { perDay.set(r.d, (perDay.get(r.d) || 0) + r.n); copyTotal += r.n; });
+    zones.rows.forEach(r => { perDay.set(r.d, (perDay.get(r.d) || 0) + r.n); zoneTotal += r.n; });
+
+    const now = Date.now();
+    const sumDays = (from, to) => { let t = 0; for (let i = from; i <= to; i++) t += perDay.get(dayKey(now - i * 86400000)) || 0; return t; };
+    const thisWeek = sumDays(0, 6), lastWeek = sumDays(7, 13);
+    let streak = 0, i = perDay.has(dayKey(now)) ? 0 : 1;   // today not yet active does not break the streak
+    while (perDay.has(dayKey(now - i * 86400000))) { streak++; i++; }
+    const last14 = [];
+    for (let k = 13; k >= 0; k--) last14.push({ day: dayKey(now - k * 86400000), n: perDay.get(dayKey(now - k * 86400000)) || 0 });
+    res.json({ copies: copyTotal, zones: zoneTotal, total: copyTotal + zoneTotal, thisWeek, lastWeek, streak, last14 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/td/feedback', authMiddleware(), async (req, res) => {
+  let rating = parseInt(req.body.rating, 10);
+  if (!(rating >= 1 && rating <= 5)) rating = null;
+  const message = tdClean(req.body.message), request = tdClean(req.body.category_request);
+  if (!rating && !message && !request) return res.status(400).json({ error: 'Nothing to send' });
+  try {
+    await ensureFeedbackTables();
+    await pool.query(
+      `INSERT INTO td_feedback (user_id, user_name, rating, message, category_request) VALUES ($1,$2,$3,$4,$5)`,
+      [req.user.id, req.user.name || null, rating, message, request]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/td/feedback/mine', authMiddleware(), async (req, res) => {
+  try {
+    await ensureFeedbackTables();
+    const { rows } = await pool.query(
+      `SELECT id, rating, message, category_request, status, created_at FROM td_feedback WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10`, [req.user.id]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/td/feedback', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureFeedbackTables();
+    const { rows } = await pool.query(`SELECT * FROM td_feedback ORDER BY created_at DESC LIMIT 1000`);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/td/feedback/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureFeedbackTables();
+    await pool.query('UPDATE td_feedback SET status = $1 WHERE id = $2', [req.body.status === 'new' ? 'new' : 'reviewed', req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = app;
