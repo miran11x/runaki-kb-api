@@ -1541,4 +1541,131 @@ app.get('/api/debug/me', authMiddleware(), async (req, res) => {
   res.json(req.user);
 });
 
+// ─────────────────────────────────────────────────────────────
+// Editable page content (Scripts, Hold & Unhold, KYC pages) and external tools
+// ─────────────────────────────────────────────────────────────
+const PAGE_CONTENT_KEYS = ['scripts', 'hold', 'kyc'];
+let contentTablesReady = null;
+function ensureContentTables() {
+  if (!contentTablesReady) {
+    contentTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS page_content (
+          key VARCHAR(40) PRIMARY KEY,
+          data JSONB NOT NULL,
+          updated_by INTEGER,
+          updated_at TIMESTAMP DEFAULT NOW()
+        )`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS external_tools (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(120) NOT NULL,
+          icon VARCHAR(16) DEFAULT '🧩',
+          url TEXT NOT NULL,
+          sort_order INTEGER DEFAULT 0,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW()
+        )`);
+    })().catch(err => { contentTablesReady = null; throw err; });
+  }
+  return contentTablesReady;
+}
+
+// Any signed-in user can read; returns { data: null } when nothing has been customised
+app.get('/api/page-content/:key', authMiddleware(), async (req, res) => {
+  if (!PAGE_CONTENT_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown page' });
+  try {
+    await ensureContentTables();
+    const { rows } = await pool.query('SELECT data, updated_at FROM page_content WHERE key = $1', [req.params.key]);
+    res.json(rows[0] ? { data: rows[0].data, updated_at: rows[0].updated_at } : { data: null });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/page-content/:key', authMiddleware(['team_lead']), async (req, res) => {
+  if (!PAGE_CONTENT_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown page' });
+  const data = req.body && req.body.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'Invalid content' });
+  try {
+    await ensureContentTables();
+    await pool.query(
+      `INSERT INTO page_content (key, data, updated_by, updated_at) VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [req.params.key, JSON.stringify(data), req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Reset to the built-in default text
+app.delete('/api/page-content/:key', authMiddleware(['team_lead']), async (req, res) => {
+  if (!PAGE_CONTENT_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown page' });
+  try {
+    await ensureContentTables();
+    await pool.query('DELETE FROM page_content WHERE key = $1', [req.params.key]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+const cleanToolUrl = u => {
+  const t = (u || '').toString().trim();
+  return /^https?:\/\/[^\s]+$/i.test(t) ? t : null;
+};
+
+// Signed-in users see active tools; team leads can ask for all with ?all=1
+app.get('/api/external-tools', authMiddleware(), async (req, res) => {
+  try {
+    await ensureContentTables();
+    const isLead = (req.user.role || '').toString().trim().toLowerCase() === 'team_lead';
+    const all = isLead && req.query.all === '1';
+    const { rows } = await pool.query(
+      `SELECT id, name, icon, url, sort_order, is_active FROM external_tools
+       ${all ? '' : 'WHERE is_active = TRUE'} ORDER BY sort_order, id`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/external-tools', authMiddleware(['team_lead']), async (req, res) => {
+  const name = (req.body.name || '').toString().trim();
+  const url = cleanToolUrl(req.body.url);
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  if (!url) return res.status(400).json({ error: 'URL must start with http:// or https://' });
+  try {
+    await ensureContentTables();
+    const { rows } = await pool.query(
+      `INSERT INTO external_tools (name, icon, url, sort_order, is_active)
+       VALUES ($1, $2, $3, COALESCE($4, 0), COALESCE($5, TRUE)) RETURNING *`,
+      [name.slice(0, 120), (req.body.icon || '🧩').toString().slice(0, 16), url,
+       Number.isFinite(+req.body.sort_order) ? +req.body.sort_order : 0, req.body.is_active]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/external-tools/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const name = (req.body.name || '').toString().trim();
+  const url = cleanToolUrl(req.body.url);
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  if (!url) return res.status(400).json({ error: 'URL must start with http:// or https://' });
+  try {
+    await ensureContentTables();
+    const { rows } = await pool.query(
+      `UPDATE external_tools SET name=$1, icon=$2, url=$3, sort_order=$4, is_active=$5 WHERE id=$6 RETURNING *`,
+      [name.slice(0, 120), (req.body.icon || '🧩').toString().slice(0, 16), url,
+       Number.isFinite(+req.body.sort_order) ? +req.body.sort_order : 0, req.body.is_active !== false, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/external-tools/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureContentTables();
+    await pool.query('DELETE FROM external_tools WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 module.exports = app;
