@@ -1342,12 +1342,15 @@ app.post('/api/faqs/import',
       await client.query('BEGIN');
 
       const existing = await client.query(
-        `SELECT LOWER(TRIM(question_en)) AS q FROM faqs WHERE COALESCE(is_shortlisted,false) = $1`,
+        `SELECT id, LOWER(TRIM(question_en)) AS q FROM faqs WHERE COALESCE(is_shortlisted,false) = $1`,
         [shortlisted]
       );
       const seen = new Set(existing.rows.map(r => r.q));
+      const existingId = new Map(existing.rows.map(r => [r.q, r.id]));
+      const TRANSLATION_COLS = ['question_ku', 'answer_ku', 'question_ba', 'answer_ba', 'question_ar', 'answer_ar'];
 
       let imported = 0;
+      let updated = 0;
       const skipped = [];
 
       for (let i = 0; i < rows.length; i++) {
@@ -1360,7 +1363,28 @@ app.post('/api/faqs/import',
         }
         const key = question.toLowerCase();
         if (seen.has(key)) {
-          skipped.push({ row: i + 1, question, reason: 'already exists' });
+          // Already in the database: never overwrite anything, but DO fill translations that are still empty
+          // (this is how a Badini column added later gets in without deleting and re-importing).
+          const id = existingId.get(key);
+          const sets = [];
+          const vals = [];
+          TRANSLATION_COLS.forEach(col => {
+            const v = clean(faq[col]);
+            if (id && v) {
+              vals.push(v);
+              sets.push(`${col} = CASE WHEN ${col} IS NULL OR TRIM(${col}) = '' THEN $${vals.length} ELSE ${col} END`);
+            }
+          });
+          let changed = 0;
+          if (sets.length) {
+            vals.push(id);
+            const before = await client.query(`SELECT ${TRANSLATION_COLS.join(', ')} FROM faqs WHERE id = $1`, [id]);
+            await client.query(`UPDATE faqs SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${vals.length}`, vals);
+            const after = await client.query(`SELECT ${TRANSLATION_COLS.join(', ')} FROM faqs WHERE id = $1`, [id]);
+            changed = TRANSLATION_COLS.filter(c => (before.rows[0] || {})[c] !== (after.rows[0] || {})[c]).length;
+          }
+          if (changed > 0) updated++;
+          else skipped.push({ row: i + 1, question, reason: 'already exists' });
           continue;
         }
         seen.add(key);
@@ -1390,7 +1414,7 @@ app.post('/api/faqs/import',
       }
 
       await client.query('COMMIT');
-      res.json({ success: true, imported, skipped });
+      res.json({ success: true, imported, updated, skipped });
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       res.status(500).json({ error: err.message });
