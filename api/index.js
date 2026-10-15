@@ -1668,4 +1668,280 @@ app.delete('/api/external-tools/:id', authMiddleware(['team_lead']), async (req,
 });
 
 
+// ─────────────────────────────────────────────────────────────
+// Ticket Descriptions (merged from the old "Agent Call Description Tool")
+// ─────────────────────────────────────────────────────────────
+let tdTablesReady = null;
+function ensureTdTables() {
+  if (!tdTablesReady) {
+    tdTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS td_categories (
+          id SERIAL PRIMARY KEY,
+          legacy_id TEXT UNIQUE,
+          level1 TEXT NOT NULL,
+          level2 TEXT,
+          level3 TEXT,
+          english TEXT NOT NULL,
+          kurdish TEXT,
+          keywords TEXT,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS td_copy_log (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER,
+          user_name TEXT,
+          category_id INTEGER,
+          level1 TEXT, level2 TEXT, level3 TEXT,
+          copied_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_td_copy_time ON td_copy_log (copied_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_td_copy_user ON td_copy_log (user_id);
+        CREATE TABLE IF NOT EXISTS td_recent (
+          user_id INTEGER NOT NULL,
+          category_id INTEGER NOT NULL REFERENCES td_categories(id) ON DELETE CASCADE,
+          pinned BOOLEAN NOT NULL DEFAULT FALSE,
+          last_used TIMESTAMP DEFAULT NOW(),
+          PRIMARY KEY (user_id, category_id)
+        );
+        CREATE TABLE IF NOT EXISTS td_flags (
+          id SERIAL PRIMARY KEY,
+          category_id INTEGER REFERENCES td_categories(id) ON DELETE CASCADE,
+          user_name TEXT,
+          note TEXT,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+      `);
+    })().catch(err => { tdTablesReady = null; throw err; });
+  }
+  return tdTablesReady;
+}
+
+const tdClean = v => {
+  if (v === undefined || v === null) return null;
+  const t = v.toString().trim();
+  return t === '' ? null : t;
+};
+
+// Active categories for everyone signed in; team leads can ask for all with ?all=1
+app.get('/api/td/categories', authMiddleware(), async (req, res) => {
+  try {
+    await ensureTdTables();
+    const isLead = (req.user.role || '').toString().trim().toLowerCase() === 'team_lead';
+    const all = isLead && req.query.all === '1';
+    const { rows } = await pool.query(
+      `SELECT id, level1, level2, level3, english, kurdish, keywords, is_active, updated_at
+       FROM td_categories ${all ? '' : 'WHERE is_active = TRUE'} ORDER BY level1, level2 NULLS FIRST, level3 NULLS FIRST, id`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/td/categories', authMiddleware(['team_lead']), async (req, res) => {
+  const level1 = tdClean(req.body.level1), english = tdClean(req.body.english);
+  if (!level1 || !english) return res.status(400).json({ error: 'Category and English text are required' });
+  try {
+    await ensureTdTables();
+    const { rows } = await pool.query(
+      `INSERT INTO td_categories (level1, level2, level3, english, kurdish, keywords, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,TRUE)) RETURNING *`,
+      [level1, tdClean(req.body.level2), tdClean(req.body.level3), english, tdClean(req.body.kurdish), tdClean(req.body.keywords), req.body.is_active]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/td/categories/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const level1 = tdClean(req.body.level1), english = tdClean(req.body.english);
+  if (!level1 || !english) return res.status(400).json({ error: 'Category and English text are required' });
+  try {
+    await ensureTdTables();
+    const { rows } = await pool.query(
+      `UPDATE td_categories SET level1=$1, level2=$2, level3=$3, english=$4, kurdish=$5, keywords=$6,
+         is_active=COALESCE($7, is_active), updated_at=NOW() WHERE id=$8 RETURNING *`,
+      [level1, tdClean(req.body.level2), tdClean(req.body.level3), english, tdClean(req.body.kurdish), tdClean(req.body.keywords), req.body.is_active, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/td/categories/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureTdTables();
+    await pool.query('DELETE FROM td_categories WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Excel import: adds new rows; a row whose Category + Sub-category + Third-level already exists is skipped
+app.post('/api/td/categories/import', authMiddleware(['team_lead']), async (req, res) => {
+  const rows = req.body.rows;
+  if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'No rows provided' });
+  const key = (a, b, c) => [a, b, c].map(x => (x || '').toString().trim().toLowerCase()).join('|');
+  try {
+    await ensureTdTables();
+    const existing = await pool.query('SELECT level1, level2, level3 FROM td_categories');
+    const seen = new Set(existing.rows.map(r => key(r.level1, r.level2, r.level3)));
+    let imported = 0; const skipped = [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const level1 = tdClean(r.level1), english = tdClean(r.english);
+      if (!level1 || !english) { skipped.push({ row: i + 1, reason: 'missing category or English text' }); continue; }
+      const k = key(level1, r.level2, r.level3);
+      if (seen.has(k)) { skipped.push({ row: i + 1, reason: 'already exists' }); continue; }
+      seen.add(k);
+      await pool.query(
+        `INSERT INTO td_categories (level1, level2, level3, english, kurdish, keywords) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [level1, tdClean(r.level2), tdClean(r.level3), english, tdClean(r.kurdish), tdClean(r.keywords)]
+      );
+      imported++;
+    }
+    res.json({ success: true, imported, skipped });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// An agent pressed "Copy": log it (once per user+category per 60 s) and remember it as recently used
+app.post('/api/td/copy', authMiddleware(), async (req, res) => {
+  const categoryId = parseInt(req.body.category_id, 10);
+  if (!categoryId) return res.status(400).json({ error: 'category_id required' });
+  try {
+    await ensureTdTables();
+    const cat = await pool.query('SELECT id, level1, level2, level3 FROM td_categories WHERE id = $1', [categoryId]);
+    if (!cat.rows[0]) return res.status(404).json({ error: 'Not found' });
+    const c = cat.rows[0];
+    const dup = await pool.query(
+      `SELECT 1 FROM td_copy_log WHERE user_id = $1 AND category_id = $2 AND copied_at > NOW() - INTERVAL '60 seconds' LIMIT 1`,
+      [req.user.id, categoryId]
+    );
+    if (!dup.rows.length) {
+      await pool.query(
+        `INSERT INTO td_copy_log (user_id, user_name, category_id, level1, level2, level3) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [req.user.id, req.user.name || null, categoryId, c.level1, c.level2, c.level3]
+      );
+    }
+    await pool.query(
+      `INSERT INTO td_recent (user_id, category_id, last_used) VALUES ($1,$2,NOW())
+       ON CONFLICT (user_id, category_id) DO UPDATE SET last_used = NOW()`,
+      [req.user.id, categoryId]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/td/recent', authMiddleware(), async (req, res) => {
+  try {
+    await ensureTdTables();
+    const { rows } = await pool.query(
+      `SELECT r.category_id, r.pinned, c.id, c.level1, c.level2, c.level3, c.english, c.kurdish, c.keywords
+       FROM td_recent r JOIN td_categories c ON c.id = r.category_id AND c.is_active = TRUE
+       WHERE r.user_id = $1 ORDER BY r.pinned DESC, r.last_used DESC LIMIT 6`,
+      [req.user.id]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/td/recent/:categoryId/pin', authMiddleware(), async (req, res) => {
+  try {
+    await ensureTdTables();
+    await pool.query(
+      `INSERT INTO td_recent (user_id, category_id, pinned, last_used) VALUES ($1,$2,TRUE,NOW())
+       ON CONFLICT (user_id, category_id) DO UPDATE SET pinned = NOT td_recent.pinned, last_used = NOW()`,
+      [req.user.id, req.params.categoryId]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// "Flag as outdated"
+app.post('/api/td/flags', authMiddleware(), async (req, res) => {
+  try {
+    await ensureTdTables();
+    await pool.query(
+      `INSERT INTO td_flags (category_id, user_name, note) VALUES ($1,$2,$3)`,
+      [parseInt(req.body.category_id, 10) || null, req.user.name || null, tdClean(req.body.note)]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/td/flags', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureTdTables();
+    const { rows } = await pool.query(
+      `SELECT f.id, f.user_name, f.note, f.status, f.created_at, c.level1, c.level2, c.level3
+       FROM td_flags f LEFT JOIN td_categories c ON c.id = f.category_id
+       ORDER BY (f.status = 'open') DESC, f.created_at DESC LIMIT 300`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/td/flags/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureTdTables();
+    await pool.query(`UPDATE td_flags SET status = $1 WHERE id = $2`, [req.body.status === 'open' ? 'open' : 'resolved', req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// One-time import from the old site's backup file. The browser sends it one table at a time, in small batches.
+// Log rows arrive with the agent's wave_id so they can be attached to the matching KB account.
+app.post('/api/td/import-backup', authMiddleware(['team_lead']), async (req, res) => {
+  const { table, rows } = req.body;
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows required' });
+  try {
+    await ensureTdTables();
+    let done = 0;
+    if (table === 'categories') {
+      for (const r of rows) {
+        if (!r.id || !tdClean(r.level1) || !tdClean(r.english)) continue;
+        const q = await pool.query(
+          `INSERT INTO td_categories (legacy_id, level1, level2, level3, english, kurdish, keywords, is_active, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,TRUE),COALESCE($9,NOW()),COALESCE($10,NOW()))
+           ON CONFLICT (legacy_id) DO NOTHING`,
+          [String(r.id), tdClean(r.level1), tdClean(r.level2), tdClean(r.level3), tdClean(r.english), tdClean(r.kurdish), tdClean(r.keywords), r.is_active, r.created_at, r.updated_at]
+        );
+        done += q.rowCount;
+      }
+    } else if (table === 'copy_log') {
+      const waves = [...new Set(rows.map(r => r.wave_id).filter(Boolean))];
+      const u = waves.length ? await pool.query('SELECT id, wave_id FROM users WHERE wave_id = ANY($1)', [waves]) : { rows: [] };
+      const byWave = new Map(u.rows.map(x => [x.wave_id, x.id]));
+      const legacy = [...new Set(rows.map(r => r.category_id).filter(Boolean).map(String))];
+      const c = legacy.length ? await pool.query('SELECT id, legacy_id FROM td_categories WHERE legacy_id = ANY($1)', [legacy]) : { rows: [] };
+      const byLegacy = new Map(c.rows.map(x => [x.legacy_id, x.id]));
+      for (const r of rows) {
+        // the old export has no unique key for log rows, so skip a row that is already there (same person, category and second)
+        const uid = byWave.get(r.wave_id) || null;
+        const cid = r.category_id ? byLegacy.get(String(r.category_id)) || null : null;
+        const q = await pool.query(
+          `INSERT INTO td_copy_log (user_id, user_name, category_id, level1, level2, level3, copied_at)
+           SELECT $1,$2,$3,$4,$5,$6,$7::timestamp
+           WHERE NOT EXISTS (SELECT 1 FROM td_copy_log WHERE user_name IS NOT DISTINCT FROM $2 AND copied_at = $7::timestamp AND level1 IS NOT DISTINCT FROM $4 AND level2 IS NOT DISTINCT FROM $5 AND level3 IS NOT DISTINCT FROM $6)`,
+          [uid, tdClean(r.account_name), cid, tdClean(r.level1), tdClean(r.level2), tdClean(r.level3), r.copied_at]
+        );
+        done += q.rowCount;
+      }
+    } else if (table === 'flags') {
+      for (const r of rows) {
+        const c = r.category_id ? await pool.query('SELECT id FROM td_categories WHERE legacy_id = $1', [String(r.category_id)]) : { rows: [] };
+        const q = await pool.query(
+          `INSERT INTO td_flags (category_id, user_name, note, status, created_at) VALUES ($1,$2,$3,$4,COALESCE($5,NOW()))`,
+          [c.rows[0] ? c.rows[0].id : null, tdClean(r.account_name), tdClean(r.note), r.status === 'resolved' ? 'resolved' : 'open', r.created_at]
+        );
+        done += q.rowCount;
+      }
+    } else {
+      return res.status(400).json({ error: 'Unknown table' });
+    }
+    res.json({ success: true, done, received: rows.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 module.exports = app;
