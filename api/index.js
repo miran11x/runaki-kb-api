@@ -189,13 +189,9 @@ app.post('/api/auth/logout', authMiddleware(), async (req, res) => {
 
 app.post('/api/auth/mfa/setup', authMiddleware(), async (req, res) => {
   try {
-    console.log('SETUP USER:', req.user);
-
     const secret = speakeasy.generateSecret({
       name: `Runaki-KB (${req.user.email})`
     });
-
-    console.log('GENERATED SECRET:', secret.base32);
 
     const result = await pool.query(
       `
@@ -283,7 +279,8 @@ app.post('/api/auth/mfa/login', async (req, res) => {
 try {
   payload = jwt.verify(
     challengeToken,
-    process.env.JWT_SECRET
+    process.env.JWT_SECRET,
+    { algorithms: ['HS256'] }
   );
 } catch (err) {
   return res.status(401).json({
