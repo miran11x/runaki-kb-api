@@ -2322,4 +2322,115 @@ app.get('/api/td/export', authMiddleware(['team_lead']), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────
+// Contact Reasons tree (category → reason → sub-reason)
+// ─────────────────────────────────────────────────────────────
+let crReady = null;
+function ensureCrTables() {
+  if (!crReady) {
+    crReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS cr_nodes (
+          id SERIAL PRIMARY KEY,
+          parent_id INTEGER REFERENCES cr_nodes(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          note TEXT,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_cr_nodes_parent ON cr_nodes (parent_id);
+      `);
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM cr_nodes');
+      if (rows[0].n === 0) {
+        const seed = require('../lib/contactReasonsSeed');
+        for (let i = 0; i < seed.length; i++) {
+          const a = await pool.query('INSERT INTO cr_nodes (parent_id, name, sort_order) VALUES (NULL,$1,$2) RETURNING id', [seed[i][0], i]);
+          for (let j = 0; j < seed[i][1].length; j++) {
+            const [reason, subs] = seed[i][1][j];
+            const b = await pool.query('INSERT INTO cr_nodes (parent_id, name, sort_order) VALUES ($1,$2,$3) RETURNING id', [a.rows[0].id, reason, j]);
+            for (let k = 0; k < subs.length; k++) {
+              await pool.query('INSERT INTO cr_nodes (parent_id, name, sort_order) VALUES ($1,$2,$3)', [b.rows[0].id, subs[k], k]);
+            }
+          }
+        }
+      }
+    })().catch(err => { crReady = null; throw err; });
+  }
+  return crReady;
+}
+
+app.get('/api/contact-reasons', authMiddleware(), async (req, res) => {
+  try {
+    await ensureCrTables();
+    const all = isLeadReq(req) && req.query.all === '1';
+    const { rows } = await pool.query(
+      `SELECT id, parent_id, name, note, sort_order, is_active FROM cr_nodes ${all ? '' : 'WHERE is_active = TRUE'} ORDER BY sort_order, id`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/contact-reasons', authMiddleware(['team_lead']), async (req, res) => {
+  const name = tdClean(req.body.name);
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    await ensureCrTables();
+    const parent = req.body.parent_id ? Number(req.body.parent_id) : null;
+    if (parent) {
+      const p = await pool.query(
+        `WITH RECURSIVE up AS (SELECT id, parent_id, 1 AS depth FROM cr_nodes WHERE id=$1
+           UNION ALL SELECT n.id, n.parent_id, up.depth+1 FROM cr_nodes n JOIN up ON n.id = up.parent_id)
+         SELECT MAX(depth)::int AS depth FROM up`, [parent]);
+      if (!p.rows[0].depth) return res.status(404).json({ error: 'Parent not found' });
+      if (p.rows[0].depth >= 3) return res.status(400).json({ error: 'The tree has 3 levels only' });
+    }
+    const m = await pool.query('SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM cr_nodes WHERE parent_id IS NOT DISTINCT FROM $1', [parent]);
+    const { rows } = await pool.query(
+      'INSERT INTO cr_nodes (parent_id, name, note, sort_order) VALUES ($1,$2,$3,$4) RETURNING id, parent_id, name, note, sort_order, is_active',
+      [parent, name, tdClean(req.body.note) || null, m.rows[0].next]);
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/contact-reasons/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const name = tdClean(req.body.name);
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    await ensureCrTables();
+    const { rows } = await pool.query(
+      `UPDATE cr_nodes SET name=$1, note=$2, is_active=COALESCE($3, is_active), updated_at=NOW() WHERE id=$4
+       RETURNING id, parent_id, name, note, sort_order, is_active`,
+      [name, tdClean(req.body.note) || null, typeof req.body.is_active === 'boolean' ? req.body.is_active : null, req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/contact-reasons/:id/move', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureCrTables();
+    const cur = await pool.query('SELECT id, parent_id FROM cr_nodes WHERE id=$1', [req.params.id]);
+    if (!cur.rows.length) return res.status(404).json({ error: 'Not found' });
+    const sibs = (await pool.query('SELECT id FROM cr_nodes WHERE parent_id IS NOT DISTINCT FROM $1 ORDER BY sort_order, id', [cur.rows[0].parent_id])).rows.map(r => r.id);
+    const i = sibs.indexOf(cur.rows[0].id);
+    const j = req.body.direction === 'up' ? i - 1 : i + 1;
+    if (j >= 0 && j < sibs.length) {
+      [sibs[i], sibs[j]] = [sibs[j], sibs[i]];
+      await pool.query('UPDATE cr_nodes SET sort_order = x.pos FROM (SELECT id, ord-1 AS pos FROM unnest($1::int[]) WITH ORDINALITY AS t(id, ord)) x WHERE cr_nodes.id = x.id', [sibs]);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/contact-reasons/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureCrTables();
+    await pool.query('DELETE FROM cr_nodes WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 module.exports = app;
