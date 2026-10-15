@@ -2575,5 +2575,6 @@ app.get('/api/admin/agents/:id', authMiddleware(['team_lead']), async (req, res)
 
 
 require('../lib/qaEvals')(app, pool, authMiddleware);
+require('../lib/searchTools')(app, pool, authMiddleware);
 
 module.exports = app;
