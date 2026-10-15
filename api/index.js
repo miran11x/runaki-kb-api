@@ -1936,6 +1936,33 @@ app.post('/api/td/import-backup', authMiddleware(['team_lead']), async (req, res
         );
         done += q.rowCount;
       }
+    } else if (table === 'zones') {
+      await ensureZoneTables();
+      const ok = rows.filter(r => tdClean(r.city) && tdClean(r.neighborhood) && tdClean(r.zone));
+      if (ok.length) {
+        const q = await pool.query(
+          `INSERT INTO td_zones (city, neighborhood, zone, keywords, is_active)
+           SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])
+           ON CONFLICT (city, neighborhood, zone) DO NOTHING`,
+          [ok.map(r => tdClean(r.city)), ok.map(r => tdClean(r.neighborhood)), ok.map(r => tdClean(r.zone)), ok.map(r => tdClean(r.keywords)), ok.map(r => r.is_active !== false)]
+        );
+        done += q.rowCount;
+      }
+    } else if (table === 'zone_lookup_log') {
+      await ensureZoneTables();
+      const waves = [...new Set(rows.map(r => r.wave_id).filter(Boolean))];
+      const u = waves.length ? await pool.query('SELECT id, wave_id FROM users WHERE wave_id = ANY($1)', [waves]) : { rows: [] };
+      const byWave = new Map(u.rows.map(x => [x.wave_id, x.id]));
+      for (const r of rows) {
+        const z = await pool.query('SELECT id FROM td_zones WHERE city=$1 AND neighborhood=$2 AND zone=$3', [tdClean(r.city), tdClean(r.neighborhood), tdClean(r.zone)]);
+        const q = await pool.query(
+          `INSERT INTO td_zone_log (user_id, user_name, zone_id, city, neighborhood, zone, looked_up_at)
+           SELECT $1,$2,$3,$4,$5,$6,$7::timestamp
+           WHERE NOT EXISTS (SELECT 1 FROM td_zone_log WHERE user_name IS NOT DISTINCT FROM $2 AND looked_up_at = $7::timestamp AND zone IS NOT DISTINCT FROM $6 AND neighborhood IS NOT DISTINCT FROM $5)`,
+          [byWave.get(r.wave_id) || null, tdClean(r.account_name), z.rows[0] ? z.rows[0].id : null, tdClean(r.city), tdClean(r.neighborhood), tdClean(r.zone), r.looked_up_at]
+        );
+        done += q.rowCount;
+      }
     } else {
       return res.status(400).json({ error: 'Unknown table' });
     }
@@ -1943,5 +1970,147 @@ app.post('/api/td/import-backup', authMiddleware(['team_lead']), async (req, res
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+
+// ─────────────────────────────────────────────────────────────
+// Zones lookup (merged from the old tool)
+// ─────────────────────────────────────────────────────────────
+let zoneTablesReady = null;
+function ensureZoneTables() {
+  if (!zoneTablesReady) {
+    zoneTablesReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS td_zones (
+          id SERIAL PRIMARY KEY,
+          city TEXT NOT NULL,
+          neighborhood TEXT NOT NULL,
+          zone TEXT NOT NULL,
+          keywords TEXT,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW(),
+          UNIQUE (city, neighborhood, zone)
+        );
+        CREATE TABLE IF NOT EXISTS td_zone_log (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER,
+          user_name TEXT,
+          zone_id INTEGER,
+          city TEXT, neighborhood TEXT, zone TEXT,
+          looked_up_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_td_zone_log_time ON td_zone_log (looked_up_at DESC);
+      `);
+    })().catch(err => { zoneTablesReady = null; throw err; });
+  }
+  return zoneTablesReady;
+}
+
+const isLeadReq = req => (req.user.role || '').toString().trim().toLowerCase() === 'team_lead';
+
+app.get('/api/td/zones', authMiddleware(), async (req, res) => {
+  try {
+    await ensureZoneTables();
+    const all = isLeadReq(req) && req.query.all === '1';
+    const { rows } = await pool.query(
+      `SELECT id, city, neighborhood, zone, keywords, is_active FROM td_zones ${all ? '' : 'WHERE is_active = TRUE'} ORDER BY city, neighborhood, id`
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/td/zones', authMiddleware(['team_lead']), async (req, res) => {
+  const city = tdClean(req.body.city), neighborhood = tdClean(req.body.neighborhood), zone = tdClean(req.body.zone);
+  if (!city || !neighborhood || !zone) return res.status(400).json({ error: 'City, neighborhood and zone are required' });
+  try {
+    await ensureZoneTables();
+    const { rows } = await pool.query(
+      `INSERT INTO td_zones (city, neighborhood, zone, keywords, is_active) VALUES ($1,$2,$3,$4,COALESCE($5,TRUE)) RETURNING *`,
+      [city, neighborhood, zone, tdClean(req.body.keywords), req.body.is_active]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That zone already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/td/zones/:id', authMiddleware(['team_lead']), async (req, res) => {
+  const city = tdClean(req.body.city), neighborhood = tdClean(req.body.neighborhood), zone = tdClean(req.body.zone);
+  if (!city || !neighborhood || !zone) return res.status(400).json({ error: 'City, neighborhood and zone are required' });
+  try {
+    await ensureZoneTables();
+    const { rows } = await pool.query(
+      `UPDATE td_zones SET city=$1, neighborhood=$2, zone=$3, keywords=$4, is_active=COALESCE($5,is_active), updated_at=NOW() WHERE id=$6 RETURNING *`,
+      [city, neighborhood, zone, tdClean(req.body.keywords), req.body.is_active, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That zone already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/td/zones/:id', authMiddleware(['team_lead']), async (req, res) => {
+  try {
+    await ensureZoneTables();
+    await pool.query('DELETE FROM td_zones WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/td/zones/bulk-delete', authMiddleware(['team_lead']), async (req, res) => {
+  const ids = (req.body.ids || []).map(n => parseInt(n, 10)).filter(Boolean);
+  if (!ids.length) return res.status(400).json({ error: 'No ids' });
+  try {
+    await ensureZoneTables();
+    const q = await pool.query('DELETE FROM td_zones WHERE id = ANY($1)', [ids]);
+    res.json({ success: true, deleted: q.rowCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Excel import: rows {city, neighborhood, zone, keywords}; ones that already exist are skipped
+app.post('/api/td/zones/import', authMiddleware(['team_lead']), async (req, res) => {
+  const rows = req.body.rows;
+  if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'No rows provided' });
+  try {
+    await ensureZoneTables();
+    const ok = rows.filter(r => r && tdClean(r.city) && tdClean(r.neighborhood) && tdClean(r.zone));
+    let imported = 0;
+    if (ok.length) {
+      const q = await pool.query(
+        `INSERT INTO td_zones (city, neighborhood, zone, keywords)
+         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
+         ON CONFLICT (city, neighborhood, zone) DO NOTHING`,
+        [ok.map(r => tdClean(r.city)), ok.map(r => tdClean(r.neighborhood)), ok.map(r => tdClean(r.zone)), ok.map(r => tdClean(r.keywords))]
+      );
+      imported = q.rowCount;
+    }
+    res.json({ success: true, imported, skipped: rows.length - imported });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// An agent opened a zone: log it once per user+zone per 60 s
+app.post('/api/td/zone-lookup', authMiddleware(), async (req, res) => {
+  const zoneId = parseInt(req.body.zone_id, 10);
+  if (!zoneId) return res.status(400).json({ error: 'zone_id required' });
+  try {
+    await ensureZoneTables();
+    const z = await pool.query('SELECT id, city, neighborhood, zone FROM td_zones WHERE id = $1', [zoneId]);
+    if (!z.rows[0]) return res.status(404).json({ error: 'Not found' });
+    const dup = await pool.query(
+      `SELECT 1 FROM td_zone_log WHERE user_id=$1 AND zone_id=$2 AND looked_up_at > NOW() - INTERVAL '60 seconds' LIMIT 1`,
+      [req.user.id, zoneId]
+    );
+    if (!dup.rows.length) {
+      await pool.query(
+        `INSERT INTO td_zone_log (user_id, user_name, zone_id, city, neighborhood, zone) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [req.user.id, req.user.name || null, zoneId, z.rows[0].city, z.rows[0].neighborhood, z.rows[0].zone]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 module.exports = app;
