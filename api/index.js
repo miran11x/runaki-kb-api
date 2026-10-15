@@ -1270,13 +1270,21 @@ app.post('/api/evaluations/upload', authMiddleware(['qa_officer','team_lead']), 
   }
 });
 
-// Get evaluations for logged-in agent (by email)
+// Get evaluations for logged-in agent.
+// Matched by email; agents imported by Wave ID have a placeholder email, so for them the
+// name on the evaluation sheet is matched too.
 app.get('/api/evaluations/mine', authMiddleware(), async (req, res) => {
   try {
-    const email = req.user.email.toLowerCase().trim();
+    const u = await pool.query('SELECT name, email FROM users WHERE id=$1', [req.user.id]);
+    const email = ((u.rows[0] && u.rows[0].email) || req.user.email || '').toLowerCase().trim();
+    const name = ((u.rows[0] && u.rows[0].name) || req.user.name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const placeholder = email.endsWith('@agents.runaki.local');
     const { rows } = await pool.query(
-      `SELECT * FROM evaluations WHERE LOWER(agent_email) = $1 ORDER BY evaluation_date DESC, id DESC`,
-      [email]
+      `SELECT * FROM evaluations
+        WHERE LOWER(TRIM(agent_email)) = $1
+           OR ($3::boolean AND $2 <> '' AND LOWER(REGEXP_REPLACE(TRIM(agent_name), '\\s+', ' ', 'g')) = $2)
+        ORDER BY evaluation_date DESC, id DESC`,
+      [email, name, placeholder]
     );
     res.json(rows);
   } catch (err) {
