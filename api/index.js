@@ -2578,5 +2578,6 @@ require('../lib/qaEvals')(app, pool, authMiddleware);
 require('../lib/searchTools')(app, pool, authMiddleware);
 require('../lib/translationReview')(app, pool, authMiddleware);
 require('../lib/teamTools')(app, pool, authMiddleware);
+require('../lib/accountsExport')(app, pool, authMiddleware);
 
 module.exports = app;
