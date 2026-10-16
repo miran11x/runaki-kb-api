@@ -2590,5 +2590,6 @@ require('../lib/accountsExport')(app, pool, authMiddleware);
 require('../lib/agentHub')(app, pool, authMiddleware);
 require('../lib/engagement')(app, pool, authMiddleware);
 shortlistInstall.mountStatus(app, pool, authMiddleware);
+require('../lib/translationQuest')(app, pool, authMiddleware);
 
 module.exports = app;
