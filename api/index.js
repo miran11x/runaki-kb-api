@@ -2580,5 +2580,6 @@ require('../lib/translationReview')(app, pool, authMiddleware);
 require('../lib/teamTools')(app, pool, authMiddleware);
 require('../lib/accountsExport')(app, pool, authMiddleware);
 require('../lib/agentHub')(app, pool, authMiddleware);
+require('../lib/engagement')(app, pool, authMiddleware);
 
 module.exports = app;
