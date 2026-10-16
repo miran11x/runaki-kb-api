@@ -7,6 +7,7 @@
     "exceljs": "^4.4.0",
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.0",
+    "mammoth": "^1.13.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",
     "speakeasy": "^2.0.0"
