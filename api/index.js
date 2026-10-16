@@ -14,6 +14,9 @@ app.use(express.json({ limit: '4mb' }));
 
 // ─── AUTH ────────────────────────────────────────────────────────────────────
 const pool = require('../lib/db');
+// one-time install of the Shortlisted FAQ's (runs on the first request after a deploy, then never again)
+const shortlistInstall = require('../lib/shortlistInstall');
+app.use(shortlistInstall.middleware(pool));
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const speakeasy = require('speakeasy');
@@ -797,25 +800,6 @@ app.patch('/api/faqs/:id/shortlist', authMiddleware(['qa_officer','team_lead']),
     await pool.query(`INSERT INTO activity_log(user_id,action,details) VALUES($1,$2,$3)`,
       [req.user.id, r.rows[0].is_shortlisted ? 'SHORTLIST_ADD' : 'SHORTLIST_REMOVE', `FAQ #${req.params.id}: ${String(r.rows[0].question_en || '').slice(0, 140)}`]).catch(() => {});
     res.json({ is_shortlisted: r.rows[0].is_shortlisted });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Helps undo mistaken shortlist changes. Shortlisted FAQs are the translated ones, so:
-//  - "wrong": shortlisted FAQs that have NO Sorani / Badini / Arabic text (probably added by mistake)
-//  - "missing": FAQs that are not shortlisted but are fully translated (probably removed by mistake)
-//  - "recent": the last shortlist changes (from the activity log)
-app.get('/api/admin/shortlist-check', authMiddleware(['qa_officer','team_lead']), async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE faqs ADD COLUMN IF NOT EXISTS is_shortlisted BOOLEAN DEFAULT false`);
-    const has = c => `(COALESCE(TRIM(question_${c}),'') <> '' AND COALESCE(TRIM(answer_${c}),'') <> '')`;
-    const cols = `id, question_en, category, subcategory, is_shortlisted, ${has('ku')} AS ku, ${has('ba')} AS ba, ${has('ar')} AS ar`;
-    const wrong = await pool.query(`SELECT ${cols} FROM faqs WHERE COALESCE(is_shortlisted,false) = true AND NOT ${has('ku')} AND NOT ${has('ba')} AND NOT ${has('ar')} ORDER BY id`);
-    const missing = await pool.query(`SELECT ${cols} FROM faqs WHERE COALESCE(is_shortlisted,false) = false AND ${has('ku')} AND ${has('ba')} AND ${has('ar')} ORDER BY id DESC LIMIT 300`);
-    const total = await pool.query(`SELECT COUNT(*) FILTER (WHERE COALESCE(is_shortlisted,false))::int AS shortlisted, COUNT(*)::int AS all FROM faqs`);
-    const recent = await pool.query(`SELECT a.action, a.details, a.created_at, u.name FROM activity_log a LEFT JOIN users u ON u.id=a.user_id WHERE a.action IN ('SHORTLIST_ADD','SHORTLIST_REMOVE') ORDER BY a.created_at DESC LIMIT 15`).catch(() => ({ rows: [] }));
-    res.json({ wrong: wrong.rows, missing: missing.rows, totals: total.rows[0], recent: recent.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2605,6 +2589,6 @@ require('../lib/teamTools')(app, pool, authMiddleware);
 require('../lib/accountsExport')(app, pool, authMiddleware);
 require('../lib/agentHub')(app, pool, authMiddleware);
 require('../lib/engagement')(app, pool, authMiddleware);
-require('../lib/shortlistSync')(app, pool, authMiddleware);
+shortlistInstall.mountStatus(app, pool, authMiddleware);
 
 module.exports = app;
