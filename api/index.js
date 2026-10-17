@@ -2304,6 +2304,26 @@ app.get('/api/td/reports/activity', authMiddleware(['team_lead']), async (req, r
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// One complete report of both tools: every copy and zone lookup (with the agent's Wave ID), the full lists, and the agents who never used them
+app.get('/api/td/reports/full', authMiddleware(['team_lead']), async (req, res) => {
+  const f = dateOrNull(req.query.from), t = dateOrNull(req.query.to);
+  try {
+    await ensureTdTables(); await ensureZoneTables();
+    const q = (sql, p = []) => pool.query(sql, p).then(r => r.rows);
+    const local = c => `to_char(${c} + INTERVAL '3 hours','YYYY-MM-DD HH24:MI:SS')`;
+    const [copies, lookups, categories, zones, agents] = await Promise.all([
+      q(`SELECT c.id, c.user_id, COALESCE(c.user_name, u.name) AS agent, u.wave_id, u.title, c.level1, c.level2, c.level3, ${local('c.copied_at')} AS at
+         FROM td_copy_log c LEFT JOIN users u ON u.id = c.user_id WHERE ${RANGE('c.copied_at')} ORDER BY c.copied_at`, [f, t]),
+      q(`SELECT z.id, z.user_id, COALESCE(z.user_name, u.name) AS agent, u.wave_id, u.title, z.city, z.neighborhood, z.zone, ${local('z.looked_up_at')} AS at
+         FROM td_zone_log z LEFT JOIN users u ON u.id = z.user_id WHERE ${RANGE('z.looked_up_at')} ORDER BY z.looked_up_at`, [f, t]),
+      q(`SELECT level1, level2, level3, is_active, (english IS NOT NULL AND english <> '') AS has_en, (kurdish IS NOT NULL AND kurdish <> '') AS has_ku, to_char(updated_at,'YYYY-MM-DD') AS updated FROM td_categories ORDER BY level1, level2 NULLS FIRST, level3 NULLS FIRST`),
+      q(`SELECT city, COUNT(*)::int AS rows, COUNT(DISTINCT neighborhood)::int AS neighborhoods, COUNT(DISTINCT zone)::int AS zones, COUNT(*) FILTER (WHERE is_active)::int AS active FROM td_zones GROUP BY city ORDER BY city`),
+      q(`SELECT id, name, wave_id, title, to_char(last_seen + INTERVAL '3 hours','YYYY-MM-DD HH24:MI') AS last_seen FROM users WHERE LOWER(role)='agent' AND is_active = TRUE ORDER BY name`),
+    ]);
+    res.json({ generated_at: new Date().toISOString(), from: f, to: t, copies, lookups, categories, zones, agents });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Duplicate log rows = same person + same item inside the same minute. dry=true only counts.
 app.post('/api/td/maintenance/duplicates', authMiddleware(['team_lead']), async (req, res) => {
   const dry = req.body.dry !== false;
